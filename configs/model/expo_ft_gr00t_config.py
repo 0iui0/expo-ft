@@ -59,10 +59,13 @@ def get_config():
     config.actor_success_only = True
 
     # GR00T handles its own image augmentation internally via the processor;
-    # the EXPO data-augmentation pipeline is disabled to avoid double-processing.
-    # Note: this applies to the ACTOR path only. Critic augmentation is applied
-    # inside EXPOLearnerGR00T.update_critic using the same augmentation function.
-    config.use_full_augmentation = True
+    # the EXPO data-augmentation pipeline (batched_openpi_augmentation) is
+    # incompatible with the GR00T critic path because it expects per-view dict
+    # keys ("base_0_rgb", "left_wrist_0_rgb") while the GR00T critic receives
+    # concatenated multi-view tensors.  Critic augmentation is a TODO — a
+    # GR00T-compatible variant that splits/transforms/re-concatenates by channel
+    # should be added in the future (paper Sec 4.3).
+    config.use_full_augmentation = False
 
     # --- GR00T modality keys (must match the embodiment's modality config) ---
     # Camera view keys in canonical order (used for critic input concatenation

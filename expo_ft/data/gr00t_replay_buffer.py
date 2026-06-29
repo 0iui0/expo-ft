@@ -336,13 +336,76 @@ class Gr00tReplayBuffer(Dataset):
         self._size = min(self._size + 1, self._capacity)
 
     def insert_dataset(self, dataset):
-        """Load offline demos; mark as HIL/success so they enter actor sampling pools."""
+        """Load offline demos; mark as HIL/success so they enter actor sampling pools.
+
+        Handles both GR00T native format (``image`` + ``state`` keys) and
+        OpenPI/Droid format (``observations`` key with ``exterior_image_1_left``,
+        ``wrist_image_left``, ``cartesian_position``, ``gripper_position``).
+        """
         logger.info("Loading %s offline episodes into GR00T replay buffer ...", len(dataset))
         for transition in tqdm.tqdm(dataset, desc="Inserting demos"):
-            transition_dict = dict(transition)
+            transition_dict = self._adapt_offline_transition(dict(transition))
             transition_dict.setdefault("is_hil", True)
             transition_dict.setdefault("is_success", True)
             self.insert(transition_dict)
+
+    def _adapt_offline_transition(self, data_dict: DatasetDict) -> DatasetDict:
+        """Convert an offline dataset transition to GR00T replay buffer format.
+
+        Detects whether the transition is already in GR00T format (has ``image``
+        key) or OpenPI/Droid format (has ``observations`` key with camera/state
+        flat keys), and converts the latter.
+        """
+        # Already GR00T format — pass through
+        if "image" in data_dict and "state" in data_dict:
+            return data_dict
+
+        # OpenPI/Droid format: data has "observations" dict
+        obs = data_dict.pop("observations", None)
+        if obs is None:
+            raise KeyError(
+                "Offline transition must contain either 'image'+'state' (GR00T format) "
+                "or 'observations' (OpenPI/Droid format). Got keys: " + str(list(data_dict.keys()))
+            )
+
+        # Map OpenPI camera keys to GR00T view keys.
+        # Convention: wrist_image_left → first view, exterior_image_1_left → second view.
+        _img_keys = [k for k in obs if isinstance(obs[k], np.ndarray) and obs[k].ndim >= 2]
+        _openpi_cam_map = {
+            "wrist_image_left": 0,
+            "exterior_image_1_left": 1,
+        }
+        images: dict = {}
+        for openpi_key, idx in _openpi_cam_map.items():
+            if openpi_key in obs and idx < len(self._camera_keys):
+                images[self._camera_keys[idx]] = np.asarray(obs[openpi_key])
+
+        # If no explicit match, assign available image keys heuristically
+        _unmatched = [k for k in _img_keys if k not in _openpi_cam_map]
+        _assigned = len(images)
+        for k in _unmatched:
+            if _assigned < len(self._camera_keys):
+                images[self._camera_keys[_assigned]] = np.asarray(obs[k])
+                _assigned += 1
+
+        # Map state: concatenate known OpenPI state keys in canonical order
+        _openpi_state_order = ["cartesian_position", "joint_position", "gripper_position"]
+        state_parts = []
+        for k in _openpi_state_order:
+            if k in obs:
+                state_parts.append(np.asarray(obs[k], dtype=np.float32).reshape(-1))
+        if not state_parts:
+            state_parts = [np.zeros(self._env_state_dim, dtype=np.float32)]
+        flat_state = np.concatenate(state_parts)
+        if len(flat_state) != self._env_state_dim:
+            padded = np.zeros(self._env_state_dim, dtype=np.float32)
+            n = min(len(flat_state), self._env_state_dim)
+            padded[:n] = flat_state[:n]
+            flat_state = padded
+
+        data_dict["image"] = images
+        data_dict["state"] = flat_state.astype(np.float32)
+        return data_dict
 
     # -- sampling ------------------------------------------------------------
 

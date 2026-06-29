@@ -373,10 +373,18 @@ def main(_):
         observation = env.get_observation()
         done, success, reward, mask = env.get_info_for_step()
 
+        # Convert env observation to GR00T format (video.* / state.* keys)
+        # for the GR00T actor and critic_inputs_from_observation.
+        gr00t_obs = actor.convert_env_obs_to_gr00t(
+            observation,
+            side_camera_id=FLAGS.config_task.side_camera_id,
+            wrist_camera_id=FLAGS.config_task.wrist_camera_id,
+        )
+
         # Skip model inference while human is controlling.
         if not action_plan and action_type != "human":
             sample_start = time.time()
-            action_chunk, _actor_agent, new_si = _actor_agent.sample_actions(observation)
+            action_chunk, _actor_agent, new_si = _actor_agent.sample_actions(gr00t_obs)
             episode_log.sample_info_history.append(new_si)
             training_log.record_sample_time(time.time() - sample_start, step_metrics)
             action_plan.extend(action_chunk[:FLAGS.replan_steps])
@@ -394,14 +402,24 @@ def main(_):
         real_action, action_type = env.step(action.tolist())
         start_step_time = time.time()
 
-        episode_log.record_step(observation, len(action_plan), action_type, real_action, reward)
+        episode_log.record_step(gr00t_obs, len(action_plan), action_type, real_action, reward)
 
         if action_type == "human":
             action_plan.clear()
 
         if has_action or action_type == "human":
+            # Build transition in Gr00tReplayBuffer.insert() format:
+            # {"image": {view: (H,W,3) uint8}, "state": (D,) float32, ...}
+            rb_image = {
+                view: gr00t_obs[f"video.{view}"]
+                for view in actor._video_keys
+            }
+            rb_state = np.concatenate(
+                [gr00t_obs[f"state.{k}"].reshape(-1) for k in actor._state_keys]
+            ).astype(np.float32)
             transition_dict = dict(
-                observations=observation,
+                image=rb_image,
+                state=rb_state,
                 actions=real_action,
                 rewards=reward,
                 masks=mask,

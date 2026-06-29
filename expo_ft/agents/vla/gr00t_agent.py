@@ -570,6 +570,101 @@ class Gr00tAgent(Model):
         t = torch.nn.functional.interpolate(t, size=tuple(size), mode="bilinear", align_corners=False)
         return t[0].permute(1, 2, 0).to(torch.uint8).numpy()
 
+    def convert_env_obs_to_gr00t(
+        self,
+        env_obs: Dict[str, Any],
+        side_camera_id: str = "",
+        wrist_camera_id: str = "",
+    ) -> Dict[str, Any]:
+        """Convert an env observation to GR00T format (``video.<view>``, ``state.<key>``).
+
+        If the observation already has ``video.*`` keys, returns as-is.
+        Otherwise converts from OpenPI/Droid-style keys using the camera ID
+        mapping.  Missing state modalities are zero-padded to the correct
+        dimension from the processor's modality config.
+
+        Args:
+            env_obs: Raw env observation dict (OpenPI or GR00T format).
+            side_camera_id: OpenPI camera key for the static/scene camera
+                (e.g. ``"table_view"``, ``"exterior_image_1_left"``).
+            wrist_camera_id: OpenPI camera key for the wrist camera
+                (e.g. ``"hand_view"``, ``"wrist_image_left"``).
+
+        Returns:
+            Dict with ``video.<view>`` (uint8), ``state.<key>`` (float32),
+            and ``prompt`` keys.
+        """
+        # Already GR00T format — pass through
+        if any(k.startswith("video.") for k in env_obs):
+            return dict(env_obs)
+
+        gr00t_obs: Dict[str, Any] = {}
+
+        # --- Images: map env camera keys to GR00T video keys ---
+        # Build a mapping from whatever image-like keys are present.
+        # Priority: explicit camera_id args, then heuristic matching.
+        _env_img_keys = [
+            k for k in env_obs
+            if isinstance(env_obs[k], np.ndarray)
+            and env_obs[k].ndim >= 2
+            and k not in ("prompt",)
+            and not k.startswith("state.")
+        ]
+
+        if side_camera_id or wrist_camera_id:
+            # Explicit mapping via task-config camera IDs
+            _cam_map = {}
+            if wrist_camera_id and len(self._video_keys) >= 1:
+                _cam_map[wrist_camera_id] = self._video_keys[0]
+            if side_camera_id and len(self._video_keys) >= 2:
+                _cam_map[side_camera_id] = self._video_keys[1]
+            # Also try common OpenPI key names as fallback
+            _cam_map.setdefault("wrist_image_left", self._video_keys[0] if len(self._video_keys) >= 1 else "")
+            _cam_map.setdefault("exterior_image_1_left", self._video_keys[1] if len(self._video_keys) >= 2 else "")
+        else:
+            # Heuristic: assign env image keys in sorted order to GR00T video keys
+            _cam_map = {}
+            for i, k in enumerate(sorted(_env_img_keys)[: len(self._video_keys)]):
+                _cam_map[k] = self._video_keys[i]
+
+        for env_key, gr00t_view in _cam_map.items():
+            if env_key in env_obs and gr00t_view:
+                gr00t_obs[f"video.{gr00t_view}"] = np.asarray(env_obs[env_key])
+
+        # --- State: map known OpenPI keys + zero-pad missing ---
+        # Common OpenPI → GR00T state-key heuristics.
+        _openpi_state_map = {
+            "cartesian_position": self._state_keys[0] if len(self._state_keys) > 0 else None,
+            "joint_position": self._state_keys[1] if len(self._state_keys) > 1 else None,
+            "gripper_position": self._state_keys[-1] if len(self._state_keys) > 2 else None,
+        }
+
+        provided: set = set()
+        for openpi_key, gr00t_key in _openpi_state_map.items():
+            if gr00t_key and openpi_key in env_obs:
+                val = np.asarray(env_obs[openpi_key], dtype=np.float32).reshape(-1)
+                target_dim = self._state_dims.get(gr00t_key, len(val))
+                if len(val) != target_dim:
+                    # Truncate or zero-pad to match expected dimension
+                    padded = np.zeros(target_dim, dtype=np.float32)
+                    n = min(len(val), target_dim)
+                    padded[:n] = val[:n]
+                    val = padded
+                gr00t_obs[f"state.{gr00t_key}"] = val
+                provided.add(gr00t_key)
+
+        # Zero-pad any remaining state keys
+        for key in self._state_keys:
+            if key not in provided:
+                gr00t_obs[f"state.{key}"] = np.zeros(
+                    self._state_dims.get(key, 1), dtype=np.float32
+                )
+
+        # --- Prompt ---
+        gr00t_obs["prompt"] = str(env_obs.get("prompt", ""))
+
+        return gr00t_obs
+
     def build_obs_dict(self, images: Dict[str, np.ndarray], flat_state: np.ndarray, prompt: str) -> Dict[str, Any]:
         """Repack flat env state + per-view images + prompt into raw-obs keys
         (``video.<view>`` / ``state.<key>`` / ``prompt``) for process_raw_inputs.

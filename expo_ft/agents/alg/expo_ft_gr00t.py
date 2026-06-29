@@ -242,6 +242,18 @@ class EXPOLearnerGR00T(EXPOLearner):
         rng = self.rng
         next_actions = jnp.asarray(next_actions)
 
+        # OpenPI-style data augmentation: apply to both current and next
+        # observations independently (paper Sec 4.3). Uses the same aug fn
+        # as the π_0.5 path, operating on the concatenated normalized float
+        # tensor. Each view within the concatenated tensor receives the same
+        # spatial transform (crop/rotation), which is equivalent to the
+        # paper's approach after concatenation.
+        aug_fn = self.data_augmentation_fn
+        key, rng = jax.random.split(rng)
+        aug_obs = aug_fn(key, batch["observations"])
+        key, rng = jax.random.split(rng)
+        aug_next_obs = aug_fn(key, batch["next_observations"])
+
         key, rng = jax.random.split(rng)
         target_params = subsample_image_ensemble(
             key, self.target_critic.params, self.num_min_qs, self.num_qs
@@ -250,7 +262,7 @@ class EXPOLearnerGR00T(EXPOLearner):
 
         next_observations = batch_encode(
             self.batch_encoder.apply_fn, self.batch_encoder.params,
-            batch["next_observations"], stop_gradient=True,
+            aug_next_obs, stop_gradient=True,
         )
         next_qs = self.target_critic.apply_fn(
             {"params": target_params}, next_observations, next_actions, False,
@@ -270,11 +282,11 @@ class EXPOLearnerGR00T(EXPOLearner):
             if self.freeze_critic_encoder:
                 observations = batch_encode(
                     self.batch_encoder.apply_fn, self.batch_encoder.params,
-                    batch["observations"], stop_gradient=True,
+                    aug_obs, stop_gradient=True,
                 )
             else:
                 observations = batch_encode(
-                    self.batch_encoder.apply_fn, params_dict["batch_encoder"], batch["observations"]
+                    self.batch_encoder.apply_fn, params_dict["batch_encoder"], aug_obs
                 )
             qs = self.critic.apply_fn(
                 {"params": params_dict["critic"]}, observations, batch["actions"], True,

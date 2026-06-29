@@ -18,6 +18,7 @@ from dataclasses import dataclass, field
 from typing import Dict, Optional, Tuple
 
 import jax
+import numpy as np
 import torch
 
 
@@ -108,6 +109,86 @@ class PyTorchTrainState:
             if p.requires_grad
         }
         return dataclasses.replace(self, ema_params=new_ema)
+
+    # ------------------------------------------------------------------
+    # Checkpoint serialization (CPU offload for orbax compatibility)
+    # ------------------------------------------------------------------
+    def state_dict(self):
+        """Return model + optimizer state dicts on CPU for orbax checkpointing.
+
+        Returns a dict with keys ``model`` and ``optimizer``, each mapping
+        parameter names to CPU ``np.ndarray`` (fp32-safe for msgpack/orbax).
+        """
+        import numpy as np  # noqa: F811
+
+        model_sd = {}
+        for name, p in self.model.state_dict().items():
+            model_sd[name] = p.detach().cpu().to(torch.float).numpy()
+
+        opt_sd = {}
+        for group_key, group_vals in self.optimizer.state_dict().items():
+            if group_key == "param_groups":
+                opt_sd[group_key] = group_vals
+            elif group_key == "state":
+                state_ser = {}
+                for param_id, state_vals in group_vals.items():
+                    state_ser[str(param_id)] = {
+                        k: v.detach().cpu().numpy() if torch.is_tensor(v) else v
+                        for k, v in state_vals.items()
+                    }
+                opt_sd[group_key] = state_ser
+            else:
+                opt_sd[group_key] = group_vals
+
+        return {"model": model_sd, "optimizer": opt_sd}
+
+    def load_state_dict(self, ckpt) -> "PyTorchTrainState":
+        """Restore model + optimizer state from a CPU checkpoint dict.
+
+        Loads fp32 CPU arrays back into the live model/optimizer, casting to
+        the model's native dtype. Returns a new ``PyTorchTrainState`` with the
+        restored step counter (optimizer state is mutated in place).
+        """
+        import numpy as np  # noqa: F811
+
+        native_dtype = next(self.model.parameters()).dtype
+        device = next(self.model.parameters()).device
+
+        # Restore model
+        model_sd = {}
+        for name, arr in ckpt["model"].items():
+            t = torch.from_numpy(np.asarray(arr)).to(device=device, dtype=native_dtype)
+            if name in self.model.state_dict():
+                target_shape = self.model.state_dict()[name].shape
+                if t.shape != target_shape:
+                    t = t.reshape(target_shape)
+            model_sd[name] = t
+        self.model.load_state_dict(model_sd, strict=False)
+
+        # Restore optimizer
+        opt_sd = ckpt["optimizer"]
+        if "state" in opt_sd:
+            restored_state = {}
+            for param_id_str, state_vals in opt_sd["state"].items():
+                restored_state[int(param_id_str)] = {
+                    k: torch.from_numpy(np.asarray(v)).to(device=device, dtype=torch.float)
+                    if isinstance(v, np.ndarray)
+                    else v
+                    for k, v in state_vals.items()
+                }
+            opt_sd["state"] = restored_state
+        self.optimizer.load_state_dict(opt_sd)
+
+        # Rebuild EMA from restored model
+        if self.ema_decay is not None:
+            new_ema = {
+                n: p.detach().clone()
+                for n, p in self.model.named_parameters()
+                if p.requires_grad
+            }
+            return dataclasses.replace(self, ema_params=new_ema)
+
+        return self
 
     # ------------------------------------------------------------------
     # Functional update helper (mirrors JAX/flax replace API)

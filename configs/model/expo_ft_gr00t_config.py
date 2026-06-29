@@ -60,6 +60,31 @@ def get_config():
 
     # GR00T handles its own image augmentation internally via the processor;
     # the EXPO data-augmentation pipeline is disabled to avoid double-processing.
-    config.use_full_augmentation = False
+    # Note: this applies to the ACTOR path only. Critic augmentation is applied
+    # inside EXPOLearnerGR00T.update_critic using the same augmentation function.
+    config.use_full_augmentation = True
+
+    # --- GR00T modality keys (must match the embodiment's modality config) ---
+    # Camera view keys in canonical order (used for critic input concatenation
+    # via ``critic_inputs_from_observation`` and replay buffer storage).
+    config.gr00t_camera_keys = ["hand_view", "table_view"]
+
+    # State modality keys in canonical order (used to split/assemble flat state).
+    config.gr00t_state_keys = ["eef_9d", "joint_pos", "gripper_pos"]
+
+    # Action modality keys in canonical order.
+    config.gr00t_action_keys = ["eef_9d", "joint_pos", "gripper_pos"]
+
+    # --- Latency / VRAM tuning ---
+    # Gradient checkpointing: recomputes activations during backward to reduce
+    # peak VRAM ~25-30% at the cost of ~15% more wall time per training step.
+    config.use_gradient_checkpointing = False
+
+    # --- Async safety ---
+    # Model access lock: when using async learner/actor mode, serializes
+    # optimizer.step() with inference forward() to prevent parameter reads
+    # during writes. Disabled by default (brief write windows are acceptable
+    # for most setups). Enable if you see NaN losses or policy collapse.
+    config.use_model_lock = False
 
     return config

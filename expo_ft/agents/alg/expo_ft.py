@@ -20,6 +20,27 @@ from expo_ft.agents.alg.agent import AgentLearner, initialize_checkpoint_dir
 from expo_ft.agents.alg.batch_utils import prepare_critic_batch, prepare_actor_sampling_batch, extract_critic_fields
 from expo_ft.networks.temperature import Temperature
 from expo_ft.data.dataset import DatasetDict
+
+# JAX 0.10 backward compat: pytype_aval_mappings was removed but is still
+# referenced by tensorflow-probability (imported via TanhNormal below).
+import jax.interpreters.xla as _xla
+if not hasattr(_xla, "pytype_aval_mappings"):
+    import numpy as _np
+    from jax._src import core as _core
+    _m = {}
+    for _dt in [_np.float32, _np.float64, _np.int32, _np.int64,
+                _np.bool_, _np.uint8, _np.complex64, _np.complex128]:
+        try:
+            _m[_dt] = _core.ShapedArray((), _np.dtype(_dt))
+        except Exception:
+            pass
+    # tfp also indexes with np.ndarray (the type, not an instance)
+    try:
+        _m[_np.ndarray] = _core.ShapedArray((), _np.dtype(_np.float32))
+    except Exception:
+        pass
+    _xla.pytype_aval_mappings = _m
+
 from expo_ft.distributions import TanhNormal
 from expo_ft.networks import (
     MLP,
@@ -45,30 +66,38 @@ def _split_params(agent: Any) -> tuple[Any, dict[str, at.Params]]:
     residual_actor_params = agent.residual_actor.params
     temp_params = agent.temp.params
     critic_params = agent.critic.params
-    
-    with at.disable_typechecking():
-        if agent.actor_train_state.ema_params is not None:
-            actor_params = agent.actor_train_state.ema_params
-            actor_train_state = dataclasses.replace(agent.actor_train_state, ema_params=None)
-        else:
-            actor_params = agent.actor_train_state.params
-            actor_train_state = dataclasses.replace(agent.actor_train_state, params={})
+
+    ats = agent.actor_train_state
+    # Duck-type: PyTorchTrainState has trainable_params() but no .params attr
+    if hasattr(ats, "trainable_params") and not hasattr(ats, "params"):
+        # GR00T path: serialize model + optimizer state dicts to CPU numpy
+        actor_params = ats.state_dict()
+        actor_train_state = dataclasses.replace(ats, model=None, optimizer=None)
+    else:
+        # JAX TrainState path (π_0.5)
+        with at.disable_typechecking():
+            if ats.ema_params is not None:
+                actor_params = ats.ema_params
+                actor_train_state = dataclasses.replace(ats, ema_params=None)
+            else:
+                actor_params = ats.params
+                actor_train_state = dataclasses.replace(ats, params={})
 
     agent = dataclasses.replace(
-        agent, 
+        agent,
         batch_encoder=dataclasses.replace(agent.batch_encoder, params={}),
-        residual_actor=dataclasses.replace(agent.residual_actor, params={}), 
-        temp=dataclasses.replace(agent.temp, params={}), 
+        residual_actor=dataclasses.replace(agent.residual_actor, params={}),
+        temp=dataclasses.replace(agent.temp, params={}),
         critic=dataclasses.replace(agent.critic, params={}),
-        actor_train_state=actor_train_state
+        actor_train_state=actor_train_state,
     )
 
     params = {
         "batch_encoder_params": batch_encoder_params,
-        "residual_actor_params": residual_actor_params, 
-        "temp_params": temp_params, 
+        "residual_actor_params": residual_actor_params,
+        "temp_params": temp_params,
         "critic_params": critic_params,
-        "actor_params": actor_params
+        "actor_params": actor_params,
     }
     return agent, params
 
@@ -79,14 +108,21 @@ def _merge_params(agent: Any, params: dict[str, at.Params]) -> Any:
     temp = dataclasses.replace(agent.temp, params=params["temp_params"])
     critic = dataclasses.replace(agent.critic, params=params["critic_params"])
 
-    with at.disable_typechecking():
-        if agent.actor_train_state.params:
-            actor_train_state = dataclasses.replace(agent.actor_train_state, ema_params=params["actor_params"])
-        else:
-            actor_train_state = dataclasses.replace(agent.actor_train_state, params=params["actor_params"])
+    ats = agent.actor_train_state
+    if hasattr(ats, "trainable_params") and not hasattr(ats, "params"):
+        # GR00T path: restore model + optimizer state dicts from CPU numpy
+        ats.load_state_dict(params["actor_params"])
+        actor_train_state = ats
+    else:
+        # JAX TrainState path (π_0.5)
+        with at.disable_typechecking():
+            if ats.params:
+                actor_train_state = dataclasses.replace(ats, ema_params=params["actor_params"])
+            else:
+                actor_train_state = dataclasses.replace(ats, params=params["actor_params"])
 
     agent = dataclasses.replace(
-        agent, 
+        agent,
         batch_encoder=batch_encoder,
         residual_actor=residual_actor,
         temp=temp,

@@ -254,6 +254,11 @@ class TestGr00tReplayBuffer:
         assert "observations" in prepared
         assert "full_actions" in prepared
         assert prepared["observations"].shape[-1] == 6
+        # uint8 -> float32 normalization for the JAX critic encoder
+        import jax.numpy as jnp
+        assert prepared["observations"].dtype == jnp.float32
+        # actions truncated to replan_steps * action_dim
+        assert prepared["actions"].shape == (4, 2 * 16)
 
 
 # =============================================================================

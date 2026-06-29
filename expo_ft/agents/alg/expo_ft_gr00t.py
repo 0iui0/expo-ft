@@ -15,9 +15,9 @@ import numpy as np
 import orbax.checkpoint as ocp
 
 from expo_ft.agents.alg.agent import AgentLearner
-from expo_ft.agents.alg.batch_utils import prepare_critic_batch
 from expo_ft.agents.alg.expo_ft import EXPOLearner, _split_params, _merge_params
 from expo_ft.data.dataset import DatasetDict
+from expo_ft.data.gr00t_replay_buffer import prepare_gr00t_critic_batch
 
 
 def load_agent(
@@ -110,22 +110,24 @@ class EXPOLearnerGR00T(EXPOLearner):
         agent = agent.replace(_infer_cache=None)
 
         # --- Data augmentation ---
+        # TODO(gr00t): per-view random crop on the critic images. The OpenPI
+        # augmentation fn hardcodes base_0_rgb/left_wrist_0_rgb and assumes
+        # [-1,1] float, so it is intentionally a no-op here until ported to the
+        # GR00T view keys (hand_view/table_view) and uint8->float inputs.
         rng = agent.rng
-        rng, key1 = jax.random.split(rng)
-        rng, key2 = jax.random.split(rng)
 
         batch = batch.copy()
-        batch["image"] = self.data_augmentation_fn(key1, batch["image"])
-        batch["next_image"] = self.data_augmentation_fn(key2, batch["next_image"])
 
-        # Prepare critic batch (extract state, pad actions, etc.)
-        batch = prepare_critic_batch(
+        # Prepare critic batch: concat camera views, normalize uint8->float,
+        # truncate action chunks to replan_steps. Uses GR00T view keys.
+        batch = prepare_gr00t_critic_batch(
             batch,
-            self.actor.model_config.action_dim,
-            self.action_dim,
-            self.state_dim,
-            self.action_horizon,
-            self.replan_steps,
+            camera_keys=self.actor._video_keys,
+            padded_dim=self.actor.model_config.action_dim,
+            action_dim=self.action_dim,
+            state_dim=self.state_dim,
+            action_horizon=self.action_horizon,
+            replan_steps=self.replan_steps,
         )
 
         new_agent = agent.replace(rng=rng)
@@ -161,16 +163,14 @@ class EXPOLearnerGR00T(EXPOLearner):
         # --- Actor update (Python, may call PyTorch) ---
         if self.actor_success_only and actor_batch is not None:
             actor_batch = actor_batch.copy()
-            rng, key = jax.random.split(new_agent.rng)
-            actor_batch["image"] = self.data_augmentation_fn(key, actor_batch["image"])
-            new_agent = new_agent.replace(rng=rng)
-            actor_batch = prepare_critic_batch(
+            actor_batch = prepare_gr00t_critic_batch(
                 actor_batch,
-                self.actor.model_config.action_dim,
-                self.action_dim,
-                self.state_dim,
-                self.action_horizon,
-                self.replan_steps,
+                camera_keys=self.actor._video_keys,
+                padded_dim=self.actor.model_config.action_dim,
+                action_dim=self.action_dim,
+                state_dim=self.state_dim,
+                action_horizon=self.action_horizon,
+                replan_steps=self.replan_steps,
             )
             new_agent, actor_info = new_agent.update_actor(actor_batch)
         else:

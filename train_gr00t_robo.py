@@ -24,7 +24,7 @@ import etils.epath as epath
 
 import wandb
 from expo_ft.agents import initialize_checkpoint_dir
-from expo_ft.data.gr00t_replay_buffer import create_gr00t_replay_buffer, prepare_gr00t_critic_batch
+from expo_ft.data.gr00t_replay_buffer import create_gr00t_replay_buffer
 from expo_ft.data.gr00t_batch_processor import Gr00tBatchProcessor
 from expo_ft.env.env_client import EnvClientWrapper
 from expo_ft.env.droid_utils import process_droid_dataset
@@ -240,9 +240,6 @@ def main(_):
     episodes_since_update = 0
     combine_rng = jax.random.PRNGKey(FLAGS.seed + 100)
 
-    # camera keys for critic batch preparation
-    camera_keys = actor._video_keys
-
     def run_agent_updates(num_updates: int, metrics: dict):
         nonlocal agent, combine_rng
         for _ in range(num_updates):
@@ -250,19 +247,6 @@ def main(_):
             batch, actor_batch, combine_rng = batch_processor.next_batch(combine_rng)
 
             metrics["batch_info"] = get_batch_info(batch)
-
-            # Prepare batch for critic (GR00T version with camera keys)
-            batch = prepare_gr00t_critic_batch(
-                batch,
-                camera_keys=camera_keys,
-                padded_dim=actor.model_config.action_dim,
-                action_dim=actor.action_dim,
-                state_dim=actor.state_dim,
-                action_horizon=actor._env_action_horizon
-                if hasattr(actor, "_env_action_horizon")
-                else actor.model_config.action_horizon,
-                replan_steps=FLAGS.replan_steps,
-            )
 
             agent = agent.replace(rng=jax.device_put(agent.rng, jax.devices()[0]))
             agent, update_info = agent.update(agent, batch, FLAGS.utd_ratio, actor_batch)

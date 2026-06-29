@@ -50,11 +50,18 @@ def prepare_gr00t_critic_batch(
     """
     batch_size = batch["state"].shape[0]
 
-    # Concatenate images along the channel axis for critic encoder
-    obs_parts = [batch["image"][k] for k in camera_keys]
+    # Concatenate camera views along the channel axis and normalize uint8 -> [0,1]
+    # float32 for the JAX ResNet critic encoder. The critic is trained from
+    # scratch; feeding raw uint8 (0-255) would produce huge activations, so we
+    # normalize here (the OpenPI pipeline the critic was designed around fed
+    # normalized float).
+    def _as_float(img):
+        return img.astype(jnp.float32) / 255.0
+
+    obs_parts = [_as_float(batch["image"][k]) for k in camera_keys]
     batch["observations"] = jnp.concatenate(obs_parts, axis=-1)
 
-    next_parts = [batch["next_image"][k] for k in camera_keys]
+    next_parts = [_as_float(batch["next_image"][k]) for k in camera_keys]
     batch["next_observations"] = jnp.concatenate(next_parts, axis=-1)
 
     batch["states"] = batch["state"].reshape(batch_size, -1)[..., :state_dim]

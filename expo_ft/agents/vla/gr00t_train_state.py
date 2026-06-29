@@ -1,58 +1,51 @@
-"""PyTorch-compatible TrainState for managing GR00T model weights within the EXPO-FT JAX framework.
+"""PyTorch TrainState for GR00T within EXPO-FT's JAX learner.
 
-This module provides a PyTorch-native alternative to JAX's TrainState that can be used
-as the `actor_train_state` field in EXPOLearner. It manages:
-- Model parameters (as a flat Python dict of numpy arrays)
-- Optimizer state
-- EMA parameters (polyak averaging)
-- Step counter
+GPU-resident design: the live ``nn.Module`` and optimizer are held *by reference*
+inside this state. There is no per-step numpy round-trip of the full state_dict
+(the previous design both crashed on bfloat16 tensors — numpy has no bf16 — and
+was a throughput/memory killer for a multi-B VLA in an online RL loop).
 
-Key design: registered as an opaque JAX pytree node so EXPOLearner can hold it
-without JAX trying to trace its contents. The state_dict is stored as numpy arrays
-for efficient serialization.
+Only the trainable (selective-unfreeze) subset of parameters is mirrored into a
+torch-native EMA dict for inference / target use. The state is registered as an
+*opaque* JAX pytree leaf so ``EXPOLearner`` (a flax ``struct.PyTreeNode``) can
+hold it without JAX trying to trace its internals.
 """
 
-import copy
-from typing import Any, Dict, Optional
+from __future__ import annotations
+
+import dataclasses
+from dataclasses import dataclass, field
+from typing import Dict, Optional, Tuple
 
 import jax
-import numpy as np
 import torch
 
 
+@dataclass
 class PyTorchTrainState:
-    """Manage PyTorch model + optimizer state, compatible with EXPOLearner interface.
-
-    Unlike JAX TrainState which holds jax arrays, this stores model params as numpy arrays
-    (extracted from state_dict) and reconstructs torch tensors on demand. This allows
-    EXPOLearner to treat `actor_train_state` as an opaque pytree leaf.
+    """Live PyTorch model + optimizer + torch EMA of trainable params.
 
     Attributes:
-        step: Training step counter.
-        params: Model parameters as {name: numpy_array} dict.
-        ema_params: EMA parameters (optional, same format as params).
-        optimizer_state: Serialized PyTorch optimizer state dict (picklable).
-        model_def: Reference to the model class for re-merging params.
-            Stored as (class_module, class_name) tuple.
-        tx_config: Optimizer config for reconstruction.
+        model: live ``nn.Module`` on device; params are mutated in place by the
+            optimizer during ``Gr00tAgent.train_step``.
+        optimizer: optimizer constructed over ``requires_grad`` params only.
+        ema_decay: Polyak averaging factor for the EMA, or ``None`` to disable.
+        step: training-step counter.
+        ema_params: ``{name: gpu_tensor}`` mirror of the trainable params, or
+            ``None`` when EMA is disabled. Used for inference weights.
+        trainable_names: cached tuple of trainable parameter names.
     """
 
-    def __init__(
-        self,
-        step: int = 0,
-        params: Optional[Dict[str, np.ndarray]] = None,
-        ema_params: Optional[Dict[str, np.ndarray]] = None,
-        optimizer_state: Optional[Dict] = None,
-        model_def: Optional[tuple] = None,
-        tx_config: Optional[Dict] = None,
-    ):
-        self.step = step
-        self.params = params or {}
-        self.ema_params = ema_params
-        self.optimizer_state = optimizer_state
-        self.model_def = model_def  # (module_path, class_name) for lazy import
-        self.tx_config = tx_config or {}
+    model: torch.nn.Module
+    optimizer: torch.optim.Optimizer
+    ema_decay: Optional[float]
+    step: int = 0
+    ema_params: Optional[Dict[str, torch.Tensor]] = None
+    trainable_names: Tuple[str, ...] = field(default_factory=tuple)
 
+    # ------------------------------------------------------------------
+    # Construction
+    # ------------------------------------------------------------------
     @classmethod
     def create(
         cls,
@@ -60,139 +53,83 @@ class PyTorchTrainState:
         optimizer: torch.optim.Optimizer,
         ema_decay: Optional[float] = None,
     ) -> "PyTorchTrainState":
-        """Create a PyTorchTrainState from a live model and optimizer.
+        """Build a state from a live model + optimizer.
 
-        Args:
-            model: PyTorch model whose parameters will be tracked.
-            optimizer: PyTorch optimizer for this model.
-            ema_decay: If provided, enable EMA tracking with this decay rate.
-
-        Returns:
-            A new PyTorchTrainState with extracted params.
+        Only parameters with ``requires_grad=True`` (the selective-unfreeze
+        subset) are tracked for EMA. The optimizer is assumed to already be
+        constructed over exactly that subset.
         """
-        params = cls._extract_params(model)
-        optimizer_state = optimizer.state_dict()
-        # Store class info as tuple for lazy reconstruction
-        model_def = (model.__class__.__module__, model.__class__.__qualname__)
-        tx_config = {
-            "lr": optimizer.param_groups[0]["lr"],
-            "weight_decay": optimizer.param_groups[0].get("weight_decay", 0.0),
-        }
-
-        ema_params = None
-        if ema_decay is not None:
-            ema_params = copy.deepcopy(params)
-
+        model.train()
+        trainable = {n: p for n, p in model.named_parameters() if p.requires_grad}
+        ema_params = (
+            {n: p.detach().clone() for n, p in trainable.items()}
+            if ema_decay is not None
+            else None
+        )
         return cls(
+            model=model,
+            optimizer=optimizer,
+            ema_decay=ema_decay,
             step=0,
-            params=params,
             ema_params=ema_params,
-            optimizer_state=optimizer_state,
-            model_def=model_def,
-            tx_config=tx_config,
+            trainable_names=tuple(trainable.keys()),
         )
 
-    @staticmethod
-    def _extract_params(model: torch.nn.Module) -> Dict[str, np.ndarray]:
-        """Extract model state_dict as numpy arrays (independent copies)."""
-        result = {}
-        for name, tensor in model.state_dict().items():
-            result[name] = tensor.detach().cpu().numpy().copy()
-        return result
+    # ------------------------------------------------------------------
+    # Param access
+    # ------------------------------------------------------------------
+    def trainable_params(self) -> Dict[str, torch.Tensor]:
+        """Current trainable params (live references, not copies)."""
+        return {n: p for n, p in self.model.named_parameters() if p.requires_grad}
 
-    @staticmethod
-    def _load_params_into_model(
-        model: torch.nn.Module, params: Dict[str, np.ndarray]
-    ) -> None:
-        """Load numpy params dict back into a PyTorch model."""
-        state_dict = {}
-        existing = model.state_dict()
-        for name, arr in params.items():
-            if name in existing:
-                dtype = existing[name].dtype
-                device = existing[name].device
-            else:
-                dtype = torch.float32
-                device = torch.device("cpu")
-            state_dict[name] = torch.tensor(arr, dtype=dtype, device=device)
-        model.load_state_dict(state_dict, strict=False)
+    def get_best_params(self) -> Dict[str, torch.Tensor]:
+        """EMA params if available, else current trainable params."""
+        return self.ema_params if self.ema_params is not None else self.trainable_params()
 
-    def update_ema(self, ema_decay: float) -> "PyTorchTrainState":
-        """Apply polyak averaging to EMA params.
+    def load_params_into_model(self, params: Dict[str, torch.Tensor]) -> None:
+        """Copy a param dict (e.g. EMA) into the live model in place."""
+        own = dict(self.model.named_parameters())
+        with torch.no_grad():
+            for name, tensor in params.items():
+                if name in own:
+                    own[name].copy_(tensor)
 
-        Args:
-            ema_decay: EMA decay rate (e.g., 0.999).
-
-        Returns:
-            New PyTorchTrainState with updated ema_params.
-        """
-        if self.ema_params is None:
+    # ------------------------------------------------------------------
+    # EMA (torch-native; works on bf16/fp32 GPU tensors)
+    # ------------------------------------------------------------------
+    def update_ema(self) -> "PyTorchTrainState":
+        """Polyak-average current trainable params into the EMA dict."""
+        if self.ema_params is None or self.ema_decay is None:
             return self
+        decay = self.ema_decay
+        new_ema = {
+            name: decay * self.ema_params[name] + (1.0 - decay) * p.detach()
+            for name, p in self.model.named_parameters()
+            if p.requires_grad
+        }
+        return dataclasses.replace(self, ema_params=new_ema)
 
-        new_ema = {}
-        for name, param in self.params.items():
-            old_ema = self.ema_params.get(name, param)
-            new_ema[name] = ema_decay * old_ema + (1.0 - ema_decay) * param
-        return PyTorchTrainState(
-            step=self.step,
-            params=self.params,
-            ema_params=new_ema,
-            optimizer_state=self.optimizer_state,
-            model_def=self.model_def,
-            tx_config=self.tx_config,
-        )
-
-    def get_best_params(self) -> Dict[str, np.ndarray]:
-        """Return best available params (EMA if available, else current)."""
-        if self.ema_params is not None:
-            return self.ema_params
-        return self.params
-
-    def incremental_update_target(
-        self, target_params: Dict[str, np.ndarray], tau: float
-    ) -> Dict[str, np.ndarray]:
-        """Polyak average update for target network params (used by EXPOLearner).
-
-        Args:
-            target_params: Current target params.
-            tau: Soft update rate (e.g., 0.001).
-
-        Returns:
-            Updated target params.
-        """
-        best_params = self.get_best_params()
-        new_target = {}
-        for name, target_val in target_params.items():
-            new_val = target_val if name not in best_params else (
-                tau * best_params[name] + (1.0 - tau) * target_val
-            )
-            new_target[name] = new_val
-        return new_target
-
+    # ------------------------------------------------------------------
+    # Functional update helper (mirrors JAX/flax replace API)
+    # ------------------------------------------------------------------
     def replace(self, **kwargs) -> "PyTorchTrainState":
-        """Create a new state with some fields replaced (mirrors JAX TrainState API)."""
-        return PyTorchTrainState(
-            step=kwargs.get("step", self.step),
-            params=kwargs.get("params", self.params),
-            ema_params=kwargs.get("ema_params", self.ema_params),
-            optimizer_state=kwargs.get("optimizer_state", self.optimizer_state),
-            model_def=kwargs.get("model_def", self.model_def),
-            tx_config=kwargs.get("tx_config", self.tx_config),
-        )
+        return dataclasses.replace(self, **kwargs)
 
 
-# Register PyTorchTrainState as an opaque JAX pytree node.
-# This prevents JAX from trying to trace its internals (numpy arrays, dicts, etc.)
-# and allows EXPOLearner to hold it as a regular pytree leaf.
+# ---------------------------------------------------------------------------
+# Register as an opaque JAX pytree leaf.
+#
+# Flatten returns no children and the whole object as auxiliary data, so JAX
+# treats the live PyTorch state as a single opaque leaf (it never tries to
+# trace/transfer the torch tensors or the optimizer). This lets EXPOLearner
+# hold it as a regular field while update() runs eagerly.
+# ---------------------------------------------------------------------------
 def _flatten_state(state):
-    """Flatten: treat the entire state as one opaque leaf."""
-    # We store the whole object as one auxiliary value
+    # Treat the whole object as one opaque leaf (no children).
     return (), state
 
 
 def _unflatten_state(aux_data, children):
-    """Unflatten: reconstruct from the opaque leaf."""
-    # children is (), aux_data is the original state object
     return aux_data
 
 

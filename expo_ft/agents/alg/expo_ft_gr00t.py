@@ -12,7 +12,6 @@ from typing import Any, Dict, Optional, Tuple
 import jax
 import jax.numpy as jnp
 import numpy as np
-import optax
 import orbax.checkpoint as ocp
 
 from expo_ft.agents.alg.agent import AgentLearner
@@ -212,14 +211,8 @@ class EXPOLearnerGR00T(EXPOLearner):
             key, self.actor_train_state, actor_batch
         )
 
-        new_train_state_params = self.actor.get_params(new_train_state)
-        target_score_params = optax.incremental_update(
-            new_train_state_params, self.target_actor_params, self.actor_tau
-        )
-
-        new_agent = self.replace(
-            actor_train_state=new_train_state,
-            target_actor_params=target_score_params,
-            rng=rng,
-        )
+        # No base-VLA target EMA on the GR00T path: EXPO's OTF / next-action
+        # sampling uses the online actor directly, and only the critic carries a
+        # Polyak target. target_actor_params stays None (see build_gr00t).
+        new_agent = self.replace(actor_train_state=new_train_state, rng=rng)
         return new_agent, info

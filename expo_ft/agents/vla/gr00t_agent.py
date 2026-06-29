@@ -6,21 +6,22 @@ serve as the VLA actor in EXPOLearnerGR00T.
 """
 from __future__ import annotations
 
-import copy
 import time
 from types import SimpleNamespace
-from typing import Any, Dict, Optional, Tuple, Union
+from typing import TYPE_CHECKING, Any, Dict, Optional, Tuple, Union
 
 import jax
 import numpy as np
 import torch
 from transformers import AutoModel, AutoProcessor
 
-from gr00t.data.embodiment_tags import EmbodimentTag
-from gr00t.data.types import MessageType, VLAStepData
-
 from expo_ft.agents.vla.vla_base import Model
 from expo_ft.agents.vla.gr00t_train_state import PyTorchTrainState
+
+if TYPE_CHECKING:
+    # gr00t is imported lazily at runtime (initialize / prepare_batch_for_actor)
+    # so this module stays importable without the gr00t package installed.
+    from gr00t.data.embodiment_tags import EmbodimentTag
 
 
 def _rec_to_dtype(x: Any, dtype: torch.dtype) -> Any:
@@ -199,9 +200,15 @@ class Gr00tAgent(Model):
 
     def init_target_params(
         self, rng: jax.random.PRNGKey, *, resume: bool = False
-    ) -> Dict[str, np.ndarray]:
-        """Create a frozen copy of model params for the EMA target network."""
-        return copy.deepcopy(self._extract_params())
+    ) -> None:
+        """Base-VLA target EMA is unused on the GR00T EXPO path.
+
+        EXPO's OTF/next-action sampling uses the *online* actor directly
+        (see ``EXPOLearnerGR00T``); only the critic has a Polyak target. We
+        therefore return None so ``EXPOLearner.create`` stores a no-op target
+        and ``update_actor`` does not maintain it.
+        """
+        return None
 
     # ------------------------------------------------------------------
     # Modality / dimension helpers
@@ -258,6 +265,7 @@ class Gr00tAgent(Model):
         ``model.forward(collated)``.
         """
         modality_cfg = self._get_modality_cfg()
+        from gr00t.data.types import MessageType, VLAStepData
 
         # Infer batch size
         if "actions" in batch:
@@ -347,40 +355,26 @@ class Gr00tAgent(Model):
         Returns:
             (new_train_state, info_dict)
         """
-        # Load saved weights into the model
-        if train_state.params:
-            self._load_params(train_state.params)
+        # The live model + optimizer are held inside train_state; update them
+        # in place. No full state_dict numpy round-trip (bf16-safe, fast).
+        model = train_state.model
+        model.train()
+        train_state.optimizer.zero_grad()
 
-        self.model.train()
-        self.optimizer.zero_grad()
-
-        outputs = self.model.forward(batch)
+        outputs = model.forward(batch)
         loss = outputs["loss"]
         loss.backward()
 
-        self.optimizer.step()
+        train_state.optimizer.step()
         if self.lr_scheduler is not None:
             self.lr_scheduler.step()
 
-        # Extract new params
-        new_params = self._extract_params()
-        new_opt_state = self.optimizer.state_dict()
-
-        # Build new train state
-        new_train_state = train_state.replace(
-            step=train_state.step + 1,
-            params=new_params,
-            optimizer_state=new_opt_state,
-        )
-
-        # EMA update (Polyak averaging inside PyTorchTrainState)
-        ema_decay = train_state.tx_config.get("ema_decay")
-        if train_state.ema_params is not None and ema_decay is not None:
-            new_train_state = new_train_state.update_ema(ema_decay)
+        new_step = train_state.step + 1
+        new_train_state = train_state.update_ema().replace(step=new_step)
 
         info: Dict[str, float] = {
-            "actor_loss": loss.item(),
-            "actor_state_step": float(train_state.step),
+            "actor_loss": float(loss.detach()),
+            "actor_state_step": float(new_step),
         }
         return new_train_state, info
 
@@ -544,10 +538,9 @@ def build_gr00t(config, seed, mesh, data_sharding, replicated_sharding, resume, 
         ema_decay=config.get("ema_decay", 0.999),
     )
 
-    if resume:
-        target_actor_params = actor.get_params(actor_train_state)
-    else:
-        target_actor_params = actor.init_target_params(None)
+    # Base-VLA target EMA is unused on the GR00T EXPO path (OTF/next-action
+    # sampling uses the online actor; only the critic has a Polyak target).
+    target_actor_params = None
 
     metadata = dict(
         action_horizon=len(

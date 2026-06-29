@@ -6,7 +6,6 @@ Marks:
 """
 from __future__ import annotations
 
-import copy
 import os
 from pathlib import Path
 
@@ -30,7 +29,7 @@ def _gr00t_checkpoint() -> Path | None:
 
 
 class TestPyTorchTrainState:
-    """Verify the opaque JAX pytree leaf that stores GR00T model weights."""
+    """Verify the opaque JAX pytree leaf that holds the live GR00T model."""
 
     @pytest.fixture(autouse=True)
     def _imports(self):
@@ -46,10 +45,10 @@ class TestPyTorchTrainState:
         state = self.PyTorchTrainState.create(model, opt, ema_decay=0.999)
 
         assert state.step == 0
-        assert len(state.params) > 0
+        assert state.model is model
         assert state.ema_params is not None
-        assert state.optimizer_state is not None
-        assert isinstance(state.model_def, tuple)
+        assert len(state.trainable_names) > 0
+        assert set(state.ema_params.keys()) == set(state.trainable_names)
 
     def test_jax_pytree_leaf(self):
         model = torch.nn.Linear(4, 2)
@@ -59,7 +58,8 @@ class TestPyTorchTrainState:
         leaves, treedef = self.jax.tree_util.tree_flatten(state)
         assert len(leaves) == 0
         restored = self.jax.tree_util.tree_unflatten(treedef, leaves)
-        assert restored.params.keys() == state.params.keys()
+        assert isinstance(restored, self.PyTorchTrainState)
+        assert restored.model is model
 
     def test_opaque_in_jax_pytree(self):
         import jax.numpy as jnp
@@ -78,15 +78,15 @@ class TestPyTorchTrainState:
         opt = torch.optim.SGD(model.parameters(), lr=0.01)
         state = self.PyTorchTrainState.create(model, opt, ema_decay=0.999)
 
-        for p in model.parameters():
-            p.data.add_(0.1)
-        new_params = self.PyTorchTrainState._extract_params(model)
-        updated = state.replace(params=new_params)
-        updated = updated.update_ema(0.999)
+        old = {n: p.detach().clone() for n, p in model.named_parameters()}
+        with torch.no_grad():
+            for p in model.parameters():
+                p.add_(0.1)
+        updated = state.update_ema()
 
-        for k in state.params:
-            expected = 0.999 * state.params[k] + 0.001 * new_params[k]
-            np.testing.assert_allclose(updated.ema_params[k], expected, atol=1e-6)
+        for n, p in model.named_parameters():
+            expected = 0.999 * old[n] + 0.001 * p.detach()
+            np.testing.assert_allclose(updated.ema_params[n], expected, atol=1e-6)
 
     def test_get_best_params_returns_ema_when_available(self):
         model = torch.nn.Linear(4, 2)
@@ -94,45 +94,38 @@ class TestPyTorchTrainState:
         state = self.PyTorchTrainState.create(model, opt, ema_decay=0.999)
         assert state.get_best_params() is state.ema_params
 
-    def test_get_best_params_falls_back_to_params(self):
+    def test_get_best_params_falls_back_to_trainable(self):
         model = torch.nn.Linear(4, 2)
         opt = torch.optim.SGD(model.parameters(), lr=0.01)
         state = self.PyTorchTrainState.create(model, opt, ema_decay=None)
-        assert state.get_best_params() is state.params
+        best = state.get_best_params()
+        assert set(best.keys()) == set(state.trainable_names)
 
-    def test_incremental_update_target(self):
+    def test_load_params_into_model_round_trip(self):
         model = torch.nn.Linear(4, 2)
         opt = torch.optim.SGD(model.parameters(), lr=0.01)
-        state = self.PyTorchTrainState.create(model, opt, ema_decay=0.999)
+        state = self.PyTorchTrainState.create(model, opt)
+        x = torch.randn(1, 4)
 
-        target = copy.deepcopy(state.params)
-        updated = state.incremental_update_target(target, tau=0.005)
+        out_before = model(x)
+        snapshot = {n: p.detach().clone() for n, p in state.trainable_params().items()}
+        with torch.no_grad():
+            for p in model.parameters():
+                p.add_(0.5)
+        state.load_params_into_model(snapshot)
+        out_after = model(x)
 
-        for k in state.params:
-            expected = 0.005 * state.ema_params[k] + 0.995 * target[k]
-            np.testing.assert_allclose(updated[k], expected, atol=1e-6)
+        assert torch.equal(out_before, out_after), "load_params_into_model round-trip changed output"
 
     def test_replace(self):
         model = torch.nn.Linear(4, 2)
         opt = torch.optim.SGD(model.parameters(), lr=0.01)
         state = self.PyTorchTrainState.create(model, opt, ema_decay=0.999)
 
-        new = state.replace(step=10, params={"w": np.array([1.0])})
+        new = state.replace(step=10)
         assert new.step == 10
-        assert new.params == {"w": np.array([1.0])}
+        assert new.model is model
         assert new.ema_params is state.ema_params
-
-    def test_extract_and_load_params_round_trip(self):
-        model = torch.nn.Linear(4, 2)
-        opt = torch.optim.SGD(model.parameters(), lr=0.01)
-        x = torch.randn(1, 4)
-
-        out_before = model(x)
-        params = self.PyTorchTrainState._extract_params(model)
-        self.PyTorchTrainState._load_params_into_model(model, params)
-        out_after = model(x)
-
-        assert torch.equal(out_before, out_after), "Round-trip changed model output"
 
 
 # =============================================================================
@@ -345,7 +338,7 @@ class TestGr00tAgentReal:
     def test_get_params_returns_dict(self):
         params = self.agent.get_params(self.train_state)
         assert isinstance(params, dict)
-        assert all(isinstance(v, np.ndarray) for v in params.values())
+        assert all(isinstance(v, torch.Tensor) for v in params.values())
 
     def test_init_target_params_returns_copy(self):
         target = self.agent.init_target_params(None)

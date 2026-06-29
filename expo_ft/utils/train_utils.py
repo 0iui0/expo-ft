@@ -131,3 +131,21 @@ def combine_batches(online_batch, offline_batch, rng):
     """
     combined = jax.tree_util.tree_map(_concat_leaves, online_batch, offline_batch)
     return _shuffle_batch(rng, combined)
+
+
+def build_gr00t_config(config):
+    """Extract GR00T settings from agent config, return flattened agent_kwargs.
+
+    Unlike ``build_pi05_config``, there is no OpenPI config to load — GR00T
+    loads its own model, processor, and statistics directly from the checkpoint
+    directory.
+
+    Returns (agent_kwargs, gr00t_model_path, gr00t_embodiment_tag, model_cls).
+    ``agent_kwargs`` is a plain dict with GR00T-specific keys removed.
+    """
+    agent_kwargs = dict(config)
+    gr00t_model_path = agent_kwargs.pop("gr00t_model_path")
+    gr00t_embodiment_tag = agent_kwargs.pop("gr00t_embodiment_tag")
+    freeze_gr00t_backbone = agent_kwargs.pop("freeze_gr00t_backbone", False)
+    model_cls = agent_kwargs.pop("model_cls")
+    return agent_kwargs, gr00t_model_path, gr00t_embodiment_tag, model_cls

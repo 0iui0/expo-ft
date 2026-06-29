@@ -174,26 +174,6 @@ class Gr00tAgent(Model):
     # Parameter helpers
     # ------------------------------------------------------------------
 
-    def _load_params(self, params_dict: Dict[str, np.ndarray]) -> None:
-        """Load numpy-array parameters into the PyTorch model."""
-        state_dict: Dict[str, torch.Tensor] = {}
-        existing_tensors = {n: p for n, p in self.model.named_parameters()}
-        existing_tensors.update({n: b for n, b in self.model.named_buffers()})
-        for name, arr in params_dict.items():
-            if name in existing_tensors:
-                ref = existing_tensors[name]
-                state_dict[name] = torch.tensor(arr, dtype=ref.dtype, device=ref.device)
-            else:
-                state_dict[name] = torch.tensor(arr, device=self.device)
-        self.model.load_state_dict(state_dict, strict=False)
-
-    def _extract_params(self) -> Dict[str, np.ndarray]:
-        """Extract current model parameters as a numpy dict."""
-        return {
-            name: tensor.detach().cpu().numpy()
-            for name, tensor in self.model.state_dict().items()
-        }
-
     def get_params(self, train_state: PyTorchTrainState) -> Dict[str, np.ndarray]:
         """Return best available params (EMA if present, else current)."""
         return train_state.get_best_params()
@@ -446,25 +426,31 @@ class Gr00tAgent(Model):
             (actions, infer_ms)
             ``actions`` shape: ``(num_samples, action_horizon, env_action_dim)``
         """
-        # Load best available params (EMA if present)
-        best_params = train_state.get_best_params()
-        if best_params:
-            self._load_params(best_params)
-        self.model.eval()
+        # GR00T path uses no actor EMA (ema_decay=None, see build_gr00t): the
+        # live model holds the online params, so inference runs on it as-is.
+        self.model.train(False)
+
+        # N-sample via a SINGLE batched forward: GR00T's flow-matching head draws
+        # independent per-batch-element initial noise (gr00t_n1d7 torch.randn), so
+        # tiling the input num_samples x along the batch axis yields num_samples
+        # diverse chunks in one call.
+        inputs = (
+            self._repeat_inputs(transformed_inputs, num_samples)
+            if num_samples > 1
+            else transformed_inputs
+        )
 
         t0 = time.perf_counter()
         with torch.inference_mode():
-            model_pred = self.model.get_action(transformed_inputs)
+            model_pred = self.model.get_action(inputs)
         infer_ms = (time.perf_counter() - t0) * 1000.0
 
-        # Model output: (1, max_action_horizon, max_action_dim)
+        # (num_samples, max_horizon, max_dim) -> (num_samples, env_horizon, env_dim)
         pred = model_pred["action_pred"].float()
-        # Slice to actual horizon and env action dim
         env_cfg = self._get_modality_cfg()
         env_horizon = len(env_cfg["action"].delta_indices)
         pred = pred[:, :env_horizon, : self.action_dim]
-        pred_np = pred.cpu().numpy()
-        return pred_np, infer_ms
+        return pred.cpu().numpy(), infer_ms
 
     def sample_training_actions(
         self,
@@ -512,6 +498,60 @@ class Gr00tAgent(Model):
         """Concatenate per-modality actions in the canonical order."""
         return np.concatenate([per_key[k] for k in self._action_keys], axis=-1)
 
+    # ------------------------------------------------------------------
+    # Critic-facing helpers (obs/state built from raw env data, NOT from GR00T)
+    # ------------------------------------------------------------------
+
+    def _repeat_inputs(self, inputs: Dict[str, Any], n: int) -> Dict[str, Any]:
+        """Tile every tensor in a BatchFeature dict n x along the batch axis."""
+        out: Dict[str, Any] = {}
+        for k, v in inputs.items():
+            if isinstance(v, torch.Tensor) and v.dim() >= 1:
+                out[k] = v.repeat(n, *([1] * (v.dim() - 1)))
+            elif isinstance(v, dict):
+                out[k] = self._repeat_inputs(v, n)
+            else:
+                out[k] = v
+        return out
+
+    @staticmethod
+    def _resize_image(img: np.ndarray, size) -> np.ndarray:
+        """Resize an (H, W, 3) uint8 image to size=(h, w)."""
+        t = torch.from_numpy(img.astype(np.float32)).permute(2, 0, 1).unsqueeze(0)
+        t = torch.nn.functional.interpolate(t, size=tuple(size), mode="bilinear", align_corners=False)
+        return t[0].permute(1, 2, 0).to(torch.uint8).numpy()
+
+    def build_obs_dict(self, images: Dict[str, np.ndarray], flat_state: np.ndarray, prompt: str) -> Dict[str, Any]:
+        """Repack flat env state + per-view images + prompt into raw-obs keys
+        (``video.<view>`` / ``state.<key>`` / ``prompt``) for process_raw_inputs.
+        """
+        obs: Dict[str, Any] = {}
+        for k, v in self._split_state(np.asarray(flat_state)).items():
+            obs[f"state.{k}"] = np.asarray(v)
+        for view in self._video_keys:
+            obs[f"video.{view}"] = np.asarray(images[view])
+        obs["prompt"] = prompt
+        return obs
+
+    def critic_inputs_from_observation(self, obs: Dict[str, Any], image_size=None) -> Tuple[np.ndarray, np.ndarray]:
+        """Build the critic observation and state from a raw env observation.
+
+        Returns (critic_obs, critic_state) with a leading batch dim of 1:
+        - critic_obs: ``(1, H, W, 3*n_views)`` uint8 (caller normalizes to float);
+        - critic_state: ``(1, state_dim)`` float32.
+        """
+        views = []
+        for view in self._video_keys:
+            img = np.asarray(obs[f"video.{view}"])
+            if image_size is not None and tuple(img.shape[:2]) != tuple(image_size):
+                img = self._resize_image(img, image_size)
+            views.append(img)
+        critic_obs = np.concatenate(views, axis=-1)[np.newaxis].astype(np.uint8)
+        flat = np.concatenate(
+            [np.asarray(obs[f"state.{k}"]).reshape(-1) for k in self._state_keys], axis=0
+        )
+        return critic_obs, flat[np.newaxis].astype(np.float32)
+
 
 def build_gr00t(config, seed, mesh, data_sharding, replicated_sharding, resume, default_prompt):
     """Build Gr00Tactor, train state, and target params from agent config.
@@ -535,7 +575,10 @@ def build_gr00t(config, seed, mesh, data_sharding, replicated_sharding, resume, 
         dtype=torch.bfloat16,
         lr=config.get("actor_lr", 1e-5),
         weight_decay=config.get("weight_decay", 1e-5),
-        ema_decay=config.get("ema_decay", 0.999),
+        # No actor EMA on the GR00T path: the trainable (selective-unfreeze)
+        # subset is ~1.5B, so an EMA copy + per-inference online/EMA swap would
+        # be prohibitive, and EXPO's OTF uses the online policy anyway.
+        ema_decay=None,
     )
 
     # Base-VLA target EMA is unused on the GR00T EXPO path (OTF/next-action

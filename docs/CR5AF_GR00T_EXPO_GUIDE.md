@@ -5,6 +5,10 @@
 
 > 背景与架构详见 [`GR00T_EXPO_RL_PIPELINE.md`](./GR00T_EXPO_RL_PIPELINE.md)。本文件是"按顺序执行"的操作手册。
 
+> ⚠️ **2026-07 末端执行器变更**：TopHand 灵巧手已无库存，CR5AF 现改用 **DH PGE 1-DOF 夹爪**（wrist-aviation 485 总线，DobotStudio DHGrip 插件模式控制开合）。当前任务为 **"grasp motor shaft and insert into bushing"**（轴套插装），数据集 `/datasets/shaft_insert`（LeRobot v2，5 episodes）。采集代码在 `thor:~/workspaces/cr5af_gripper/`（`record_demo_gripper.py`、`dh_gripper.py`、`convert_to_lerobot.py`）。
+>
+> **embodiment 维度未变**——仍为 16-dim（`eef_9d(9)+joint_pos(6)+gripper_pos(1)`，2 相机 hand_view/table_view），故 `examples/CR5AF/cr5af_config.py` 的 `NEW_EMBODIMENT` 配置、expo-ft 的 `configs/task/cr5af.py`、以及全部 b8 修复（RELATIVE decode 等）**原样沿用，无需改任何代码**。已验证：SFT 产出 checkpoint → 统一 venv 加载 → `tests/test_gr00t_learner_smoke.py` 通过（jax critic + torch 3B actor 共存于 GPU1）。下文 Step 1–2 为夹爪 + shaft_insert 路径；只有采集脚本 / 任务 / 数据集 / reward 判据变了。
+
 ---
 
 ## 0. 前置条件
@@ -26,21 +30,21 @@ export XLA_PYTHON_CLIENT_PREALLOCATE=false
 
 ---
 
-## Step 1：采集 CR5AF 数据
+## Step 1：采集 CR5AF 数据（DH PGE 夹爪）
 
-采集在 **thor（机器人控制机）** 上进行（需要 RealSense D405/D455 + SpaceMouse + ServoP），不是训练机。
+采集在 **thor（机器人控制机）** 上进行，代码在 `thor:~/workspaces/cr5af_gripper/`（需 RealSense D405/D455 + SpaceMouse + ServoP + DobotStudio DHGrip 插件已启用、`grip_open`/`grip_close` 项目已建）。**末端执行器现为 DH PGE 1-DOF 夹爪**（非 TopHand）。
 
 ```bash
 # 在 thor 上：
-cd ~/workspaces/hil-serl
-.venv/bin/python record_demo.py \
+cd ~/workspaces/cr5af_gripper
+~/workspaces/hil-serl/.venv/bin/python record_demo_gripper.py \
   --robot-ip 192.168.5.1 \
-  --task "pick motor housing and place on fixture" \
-  --grasp-pose grasp_housing \
-  --output-dir recordings/cr5af_demos \
+  --task "grasp motor shaft and insert into bushing" \
+  --grasp-pose grasp_shaft \
+  --output-dir recordings/shaft_insert \
   --translation-only --preview
 ```
-产出 `.npz` 原始录制（每 episode 含 CR5AF RT state、D405/D455 图像、TopHand 夹爪状态）。
+产出 `recordings/shaft_insert/episode_*/data.npz`（每 episode 含 CR5AF RT state、D405/D455 图像、DH PGE 夹爪状态）。
 
 **关键经验（已踩坑，见 Isaac-GR00T `examples/CR5AF/README.md`）：**
 - **rot6d 必须用 `tool_vector[3:6]`（TCP axis-angle）算**，绝不能用 RT 自带 quaternion（offset 1384 的 quat 不代表 TCP 姿态，误差 120°）。
@@ -49,21 +53,24 @@ cd ~/workspaces/hil-serl
 ### 1.1 转成 LeRobot v2
 
 ```bash
-# 训练机上（数据量大）：
-cd ~/workspace/3rd/Isaac-GR00T
-.venv/bin/python examples/CR5AF/convert_to_lerobot.py \
-  --input-dir recordings/cr5af_demos \
-  --output-dir /datasets/cr5af_grasp_housing \
-  --fps 30 \
-  --lookahead 50        # ⚠️ 必须 50：action[t]=state[t+50]，把 0.05mm/步的 delta 放大到 4.4mm/步，模型才能跟踪
+# 在 thor 上（原始录制所在机）：
+cd ~/workspaces/cr5af_gripper
+~/workspaces/hil-serl/.venv/bin/python convert_to_lerobot.py \
+  --input-dir recordings/shaft_insert \
+  --output-dir /datasets/shaft_insert \
+  --fps 30
+  # --lookahead N   # action[t]=state[t+N]（绝对目标）；N 越大单步 delta 越大。grasp_housing 曾用 50；
+                    # shaft_insert 用本脚本默认。转换后把 /datasets/shaft_insert 同步到训练机。
 ```
-产出 LeRobot v2（parquet + mp4）。现有数据集见 `/datasets/cr5af_grasp_housing_l50`（成功 episodes，用于 BC）、`/datasets/cr5af_grasp_housing_l50_rl`（含失败，用于 critic）。
+产出 LeRobot v2（parquet + mp4，state/action=16）。`/datasets/shaft_insert`（5 episodes）已同步到训练机。
+
+> ⚠️ **rot6d / SVD 踩坑**：若 SFT 报 `Rotation.from_matrix` → `SVD did not converge`，是转换出的 rot6d 有坏帧（`eef_9d[3:9]` 必须是有效旋转）。**重新用 `convert_to_lerobot.py` 转换即可**（2026-07 在 shaft_insert 上遇到过，重转后 SFT 正常）。rot6d 必须由 `tool_vector[3:6]`（TCP axis-angle）算，不能用 RT 自带 quaternion。
 
 ---
 
 ## Step 2：BC 微调 GR00T N1.7（SFT）
 
-在训练机、**Isaac venv**、GPU1 上跑。生产脚本 `examples/CR5AF/finetune_l50.sh`（`--tune-visual --no-tune-llm --tune-top-llm-layers 2`，lookahead 50）。下面是最小可复现版（已在 RTX 5090 验证可产出可加载 checkpoint）：
+在训练机、**Isaac venv**、GPU1 上跑。**当前 shaft_insert 流水线测试脚本**：`examples/CR5AF/finetune_shaft_insert_test.sh`（`--tune-visual --no-tune-llm --tune-top-llm-layers 2`，500 步 → 产出可加载 `checkpoint-500`，已验证可进入 RL）。生产级长 run 把 `--max-steps/--save-steps` 调大、episode 补到 500+。下面是最小可复现版：
 
 ```bash
 cd ~/workspace/3rd/Isaac-GR00T
@@ -73,11 +80,11 @@ BASE="$HOME/.cache/modelscope/nv-community/GR00T-N1.7-3B"
 
 .venv/bin/python gr00t/experiment/launch_finetune.py \
   --base-model-path "$BASE" \
-  --dataset-path /datasets/cr5af_grasp_housing_l50 \
+  --dataset-path /datasets/shaft_insert \
   --modality-config-path examples/CR5AF/cr5af_config.py \
   --embodiment-tag NEW_EMBODIMENT \
-  --output-dir /tmp/cr5af_finetune \
-  --experiment-name cr5af-grasp \
+  --output-dir /tmp/cr5af_shaft_insert_test \
+  --experiment-name shaft-insert-pipeline-test \
   --max-steps 20000 \
   --save-steps 2000 \
   --save-only-model \
@@ -86,8 +93,8 @@ BASE="$HOME/.cache/modelscope/nv-community/GR00T-N1.7-3B"
   --tune-visual --no-tune-llm --tune-top-llm-layers 2
 ```
 
-**checkpoint 产出位置**：`/tmp/cr5af_finetune/cr5af-grasp/checkpoint-<step>/`
-内含 `config.json` + `processor_config.json`（根目录，**standalone 可加载**）+ `experiment_cfg/` + safetensors 分片。
+**checkpoint 产出位置**：`/tmp/cr5af_shaft_insert_test/shaft-insert-pipeline-test/checkpoint-<step>/`（测试脚本产 `checkpoint-500`）
+内含 `config.json` + `model-*.safetensors` + `model.safetensors.index.json` + `processor_config.json` + `statistics.json` + `embodiment_id.json`（根目录，**standalone 可加载**）；`experiment_cfg/`、`processor/` 在实验根目录。
 
 > **调参红线（来自团队训练史 v1–v6）**：frozen VLM 不够（v1/v2 固定输出）；必须 `--tune-visual`（v3 起有轨迹方向）；RTX 5090 32GB 全调 LLM 装不下（需 80GB+），所以只调 top-2 LLM 层；想要更高精度需 500+ episodes 或 A100/H100。lookahead 50 是精度拐点（v5 能跟踪目标，~5mm）。
 
@@ -100,7 +107,7 @@ CUDA_VISIBLE_DEVICES=1 XLA_PYTHON_CLIENT_PREALLOCATE=false \
 from pathlib import Path; import torch
 from expo_ft.agents.vla.gr00t_agent import Gr00tAgent
 actor, ts, _ = Gr00tAgent.initialize(
-    model_path=Path('/tmp/cr5af_finetune/cr5af-grasp/checkpoint-20000'),
+    model_path=Path('/tmp/cr5af_shaft_insert_test/shaft-insert-pipeline-test/checkpoint-500'),
     embodiment_tag='NEW_EMBODIMENT', device='cuda:0', dtype=torch.bfloat16)
 print('OK', sum(p.numel() for p in actor.model.parameters())/1e9, 'B params')
 "
@@ -110,6 +117,8 @@ print('OK', sum(p.numel() for p in actor.model.parameters())/1e9, 'B params')
 ---
 
 ## Step 3：Rollout 测试（部署验证）
+
+> ⚠️ **夹爪 rollout 暂未就绪**：`deploy_cr5af.py` 是 TopHand 时代的部署脚本（含 `--tophand-hand`）。DH PGE 夹爪的在线 rollout / env server（C1）尚未实现——这是接 EXPO-FT 在线 RL 的硬阻塞，需要机器人侧开发（见 §4.4）。下面的命令保留作历史参考；夹爪版需新建 env server，协议见 `expo_ft/env/env_client.py` 的 `EnvClientWrapper`（step/reset/get_observation/get_info_for_step，端口 8102，observation 须为 GR00T flat-key 格式）。
 
 GR00T 原生部署用 `deploy_cr5af.py`（ZMQ server/client 架构）：
 
@@ -135,7 +144,7 @@ cd ~/workspaces/hil-serl
 - ServoP 阻抗：用 `FCSetStiffness/FCSetDamping` + `ServoP(..., gain=300)`；`set_impedance()` 是无效 API。
 - 延迟：TRT full pipeline (2 samples) ≈ 350ms 是当前最优；纯 PyTorch ≈ 600ms 太慢。
 
-**离线 smoke**（不连机械臂，验证 checkpoint 推理）：用 `examples/CR5AF/preview_episode.py` 或本仓库的 `/tmp/smoke_learner.py`（已验证 forward 产 finite actions）。
+**离线 smoke**（不连机械臂，验证 checkpoint 推理 + RL 更新步）：用 `examples/CR5AF/preview_episode.py`（纯推理）或本仓库 `tests/test_gr00t_learner_smoke.py`（见 §4.2，jax+torch+gr00t 共存验证，需 `GR00T_CKPT`）。
 
 ---
 
@@ -158,12 +167,15 @@ cd ~/workspaces/hil-serl
 
 ### 4.2 learner smoke（RL 更新步验证，不连机械臂）
 
+已沉淀为正式 GPU 集成测试 `tests/test_gr00t_learner_smoke.py`（jax critic + torch 3B actor 共存于一次 `agent.update()`）。需 `GR00T_CKPT` 指向一个可加载 checkpoint：
+
 ```bash
 cd ~/workspace/3rd/expo-ft
+GR00T_CKPT=/tmp/cr5af_shaft_insert_test/shaft-insert-pipeline-test/checkpoint-500 \
 CUDA_VISIBLE_DEVICES=1 XLA_PYTHON_CLIENT_PREALLOCATE=false \
-.venv/bin/python /tmp/smoke_learner.py
+.venv/bin/python -m pytest tests/test_gr00t_learner_smoke.py -s -v
 ```
-应打印 `✓ SMOKE TEST PASSED` + `actor_loss/critic_loss/q` 等有限值。这验证 jax+torch+gr00t 在一次 `update()` 里共存。
+应 `1 passed`（约 75s），内部断言 finite losses + dead-config 超参到位。已在 shaft_insert checkpoint-500 上验证通过。无 `GR00T_CKPT` 或无 CUDA 时自动 skip。
 
 ### 4.3 在线 RL 训练（需要 env server）
 
@@ -178,8 +190,8 @@ CUDA_VISIBLE_DEVICES=1 XLA_PYTHON_CLIENT_PREALLOCATE=false \
 
 ```bash
 cd ~/workspace/3rd/expo-ft
-GR00T_CKPT=/tmp/cr5af_finetune/cr5af-grasp/checkpoint-20000 \
-DATASET_PATH=/datasets/cr5af_grasp_housing_l50 \
+GR00T_CKPT=/tmp/cr5af_shaft_insert_test/shaft-insert-pipeline-test/checkpoint-500 \
+DATASET_PATH=/datasets/shaft_insert \
 bash scripts/train_gr00t_cr5af.sh
 ```
 （脚本默认：batch 4、UTD 20、offline_ratio 0.5、replan 8、actor_lr 3e-5、critic_lr 3e-4、20000 步、wandb `expo-ft-gr00t`。改环境变量调参。）
@@ -196,10 +208,10 @@ bash scripts/train_gr00t_cr5af.sh
 
 | 阶段 | 仓库 | venv | GPU | 关键命令 |
 |---|---|---|---|---|
-| 采集 | Isaac-GR00T | thor: hil-serl | — | `record_demo.py` |
-| 转 LeRobot | Isaac-GR00T | Isaac `.venv` | CPU | `convert_to_lerobot.py --lookahead 50` |
-| SFT (BC) | Isaac-GR00T | Isaac `.venv` | GPU1 | `launch_finetune.py --tune-visual …` |
-| checkpoint 验证 / learner smoke | expo-ft | expo-ft `.venv` | GPU1 | `Gr00tAgent.initialize(...)` / `smoke_learner.py` |
+| 采集 | cr5af_gripper | thor: hil-serl `.venv` | — | `record_demo_gripper.py`（DH PGE 夹爪） |
+| 转 LeRobot | cr5af_gripper | thor: hil-serl `.venv` | CPU | `convert_to_lerobot.py`（thor 上跑）→ `/datasets/shaft_insert` |
+| SFT (BC) | Isaac-GR00T | Isaac `.venv` | GPU1 | `examples/CR5AF/finetune_shaft_insert_test.sh` |
+| checkpoint 验证 / learner smoke | expo-ft | expo-ft `.venv` | GPU1 | `Gr00tAgent.initialize(...)` / `tests/test_gr00t_learner_smoke.py` |
 | rollout | Isaac-GR00T | Isaac `.venv` (server) + thor (client) | GPU1 | `deploy_cr5af.py --server/--client` |
 | 在线 RL | expo-ft | expo-ft `.venv` | GPU1 | `train_gr00t_cr5af.sh` |
 

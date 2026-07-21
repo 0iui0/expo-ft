@@ -41,7 +41,7 @@ EXPO = Base VLA (π_θ) + Edit Policy (residual Δ) + OTF argmax-Q selection + R
 │ GPU0 (RTX 5090)                                 │
 │ ┌───────────────────────────────────────────┐   │
 │ │  Actor (PyTorch)                          │   │
-│ │  - GR00T N1.7 model (~7B, bf16)           │   │
+│ │  - GR00T N1.7-3B model (~3.1B params, bf16)           │   │
 │ │  - Flow-matching inference (action gen)   │   │
 │ │  - Actor BC training (success-only)       │   │
 │ │  - Isaac-GR00T venv (torch 2.11+cu130)    │   │
@@ -104,7 +104,7 @@ Environment Server (WebSocket :8102)
 #### expo-ft venv (Learner: JAX, GPU1)
 
 ```bash
-cd /home/zpa/workspace/3rd/expo-ft
+cd ~/workspace/3rd/expo-ft
 
 # 创建 Python 3.12 venv
 uv venv --python 3.12
@@ -115,9 +115,9 @@ uv sync
 # 手动安装自编译 JAX (RTX 5090 sm_120 需要自编译)
 # JAX 0.10.1 自编译路径
 source .venv/bin/activate
-pip install /home/zpa/.cache/bazel_old/jax/jaxlib/tools/dist/jaxlib-0.10.1.dev0+selfbuilt-cp312-cp312-linux_x86_64.whl
-pip install /home/zpa/.cache/bazel_old/jax/jax_cuda13_plugin-0.10.1.dev0+selfbuilt-cp312-cp312-linux_x86_64.whl
-pip install /home/zpa/.cache/bazel_old/jax/jax_cuda13_pjrt-0.10.1.dev0+selfbuilt-cp312-cp312-linux_x86_64.whl
+pip install ~/.cache/bazel_old/jax/jaxlib/tools/dist/jaxlib-0.10.1.dev0+selfbuilt-cp312-cp312-linux_x86_64.whl
+pip install ~/.cache/bazel_old/jax/jax_cuda13_plugin-0.10.1.dev0+selfbuilt-cp312-cp312-linux_x86_64.whl
+pip install ~/.cache/bazel_old/jax/jax_cuda13_pjrt-0.10.1.dev0+selfbuilt-cp312-cp312-linux_x86_64.whl
 ```
 
 验证:
@@ -132,23 +132,22 @@ Actor 推理/训练使用 Isaac-GR00T 的 Python 环境:
 
 ```bash
 # Isaac-GR00T 已有 venv:
-/home/zpa/workspace/3rd/Isaac-GR00T/.venv/bin/python -c "import torch; print('PyTorch', torch.__version__)"
+~/workspace/3rd/Isaac-GR00T/.venv/bin/python -c "import torch; print('PyTorch', torch.__version__)"
 # Expected output: PyTorch 2.11.0+cu130
 ```
 
 ### 2.3 GR00T 模型下载
 
 ```bash
-# 从 ModelScope 下载 GR00T N1.7 基础模型
-# (如果已下载则跳过)
-mkdir -p ~/.cache/modelscope_old/nv-community/
-# 模型路径: ~/.cache/modelscope_old/nv-community/GR00T-N1___7-3B/
+# ModelScope: GR00T N1.7-3B (版本 N1.7，3B 参数变体；非 7B)
+# 模型路径: ~/.cache/modelscope/nv-community/GR00T-N1.7-3B/
+#   (软链接 GR00T-N1.7-3B -> GR00T-N1___7-3B)
 
 # 目录结构:
-# GR00T-N1___7-3B/
+# GR00T-N1.7-3B/   (~3.14B params, SFT 时 47.67% trainable)
 #   config.json
-#   model-00001-of-00002.safetensors   (~3.5GB)
-#   model-00002-of-00002.safetensors   (~3.5GB)
+#   model-00001-of-00002.safetensors   (~3GB)
+#   model-00002-of-00002.safetensors   (~3GB)
 #   processor_config.json
 #   statistics.json
 #   embodiment_id.json
@@ -163,50 +162,66 @@ mkdir -p ~/.cache/modelscope_old/nv-community/
 
 ### 3.1 注册 Embodiment
 
-在 Isaac-GR00T 中注册你的新 embodiment（例如 `CR5AF_TOP_HAND`）。
+CR5AF 的 modality 配置定义在 `examples/CR5AF/cr5af_config.py`，通过 `register_modality_config(..., embodiment_tag=EmbodimentTag.NEW_EMBODIMENT)` 注册为 `NEW_EMBODIMENT`：
 
-参考: Isaac-GR00T 仓库的 embodiment 注册流程。
+- 2 路相机: `hand_view` (D405 腕部) + `table_view` (D455 固定第三视角)
+- state: `eef_9d`(9) + `joint_pos`(6) + `gripper_pos`(1) = 16 维
+- action: 同 16 维，10 步预测 horizon，delta_indices `range(0,10)`
+- video: 2 帧 history，delta_indices `[-20, 0]`
+
+`launch_finetune.py` 会自动 `import` 该文件完成注册（见 `--modality-config-path`）。
 
 ### 3.2 准备示教数据
 
-将遥控数据转为 GR00T 格式存储：
+CR5AF 实际使用 **LeRobot v2 格式**（非 Droid HDF5）。用 `examples/CR5AF/convert_to_lerobot.py` 把遥控原始数据转换为：
 
-- 图片: 每个视角保存为 `video.<view>` key，格式 uint8 (H, W, 3)
-- 状态: 每个 modality 保存为 `state.<key>` key，格式 float32
-- 动作: 每个 modality 保存为 `action.<key>` key，格式 float32
-- 语言指令: 自然语言 task description
+```
+/datasets/cr5af_grasp_housing_l50/
+  meta/        # info.json, stats.json, modality.json, episodes.jsonl, tasks.jsonl
+  data/chunk-000/episode_XXXXXX.parquet   # state(16) + action(16) per frame, fps=30
+  videos/chunk-000/<view>/episode_XXXXXX.mp4
+```
 
 ### 3.3 运行 SFT Finetuning
 
-```bash
-cd /home/zpa/workspace/3rd/Isaac-GR00T
-source .venv/bin/activate
+入口是 `gr00t/experiment/launch_finetune.py`（**不是** `scripts/finetune.py`，该文件不存在）。参考封装脚本 `examples/CR5AF/finetune_l50.sh`：
 
-# 使用 Isaac-GR00T 的 finetune 脚本
-# 示例 (以实际脚本为准):
-python scripts/finetune.py \
-    --model_path ~/.cache/modelscope_old/nv-community/GR00T-N1___7-3B/ \
-    --embodiment CR5AF_TOP_HAND \
-    --dataset_path /datasets/cr5af_demos/ \
-    --output_dir ./checkpoints/cr5af_sft/ \
-    --num_epochs 10 \
-    --batch_size 2 \
-    --learning_rate 3e-5
+```bash
+cd ~/workspace/3rd/Isaac-GR00T
+
+.venv/bin/python gr00t/experiment/launch_finetune.py \
+  --base-model-path "$HOME/.cache/modelscope/nv-community/GR00T-N1.7-3B" \
+  --dataset-path /datasets/cr5af_grasp_housing_l50 \
+  --modality-config-path examples/CR5AF/cr5af_config.py \
+  --embodiment-tag NEW_EMBODIMENT \
+  --output-dir /tmp/cr5af_finetune_v5 \
+  --experiment-name grasp-housing-v5-l50 \
+  --max-steps 20000 --save-steps 5000 \
+  --global-batch-size 4 --dataloader-num-workers 0 \
+  --learning-rate 1e-5 --episode-sampling-rate 0.1 \
+  --tune-visual --no-tune-llm --tune-top-llm-layers 2
 ```
+
+> 仅用于跑通 RL 代码路径时，可用短 run（`--max-steps 600 --save-steps 300 --save-only-model`），见 `examples/CR5AF/finetune_test_ckpt.sh`。生产级策略照上面的长 run。
+> ⚠️ 不要把 `WANDB_API_KEY` 写进脚本（`finetune_l50.sh` 历史版本含硬编码 key，勿复制传播）；默认 `use_wandb=False`，需要时用环境变量传入。
 
 ### 3.4 验证 SFT Checkpoint
 
-确保 SFT 输出目录包含以下文件:
+可加载的 checkpoint 落在 **`<output_dir>/<experiment_name>/checkpoint-<step>/`**（每个 `save_steps` 保存一次；`CheckpointFormatCallback.on_save` 会把 `processor/` 复制进该目录，使其自包含）：
 
 ```
-checkpoints/cr5af_sft/
+/tmp/cr5af_finetune_v5/grasp-housing-v5-l50/checkpoint-5000/
   config.json
-  model.safetensors           # 或 model-00001-of-00002.safetensors + model-00002-of-00002.safetensors
-  processor_config.json
+  model-00001-of-00002.safetensors   # GR00T-N1.7-3B 权重 (~3GB)
+  model-00002-of-00002.safetensors
+  model.safetensors.index.json
+  processor_config.json              # 复制自 processor/
   statistics.json
-  scheduler.pt                 # (可选)
-  trainer_state.json            # (可选)
+  embodiment_id.json
+  experiment_cfg/                    # conf.yaml, config.yaml 等
 ```
+
+`Gr00tAgent.initialize` 通过 `AutoModel.from_pretrained(checkpoint_dir)` + `AutoProcessor.from_pretrained(checkpoint_dir)` 加载，因此 RL 配置里的 `gr00t_model_path` 应指向这个 `checkpoint-<step>/` 目录。注意：`processor/` 与 `experiment_cfg/` 在实验根目录也存在，但**没有 `checkpoint-<step>/` 子目录就意味着没有保存权重**（v5/v6 历史run 被中断在此状态，不可直接用于 RL）。
 
 ---
 
@@ -247,7 +262,7 @@ python env_server.py --port 8102
 
 ```bash
 # 在训练机上验证可以连接到环境服务器
-cd /home/zpa/workspace/3rd/expo-ft
+cd ~/workspace/3rd/expo-ft
 source .venv/bin/activate
 
 python -c "
@@ -271,29 +286,16 @@ print('Done')
 
 ### 5.1 数据集格式
 
-即使做纯在线 RL，也需要一个离线数据集（用于初始化 replay buffer 和 agent 结构推断）。
+CR5AF 使用 **LeRobot v2 格式**（parquet + mp4，**非 Droid HDF5**）。实际数据集：
 
-数据集目录结构:
 ```
-/datasets/cr5af_grasp_housing/
-  train/
-    data_0.hdf5   # 或 .npz 文件
-    data_1.hdf5
-    ...
+/datasets/cr5af_grasp_housing_l50/     # 103 episodes, fps=30, state/action dim=16, ~509MB
+  meta/{info.json,stats.json,modality.json,episodes.jsonl,tasks.jsonl}
+  data/chunk-000/episode_XXXXXX.parquet
+  videos/chunk-000/{hand_view,table_view}/episode_XXXXXX.mp4
 ```
 
-每个 sample 包含:
-```python
-{
-    "image": {
-        "hand_view":  np.ndarray (H, W, 3) uint8,
-        "table_view": np.ndarray (H, W, 3) uint8,
-    },
-    "state":      np.ndarray (state_dim,) float32,
-    "actions":    np.ndarray (action_horizon, action_dim) float32,
-    "prompt":     "task description string",
-}
-```
+> ⚠️ **数据接入缺口**：`Gr00tReplayBuffer.insert_dataset` → `_adapt_offline_transition` 只识别 GR00T 原生格式（`image`+`state`）或 OpenPI/Droid 格式（`observations`），**不能直接读 LeRobot parquet**。在线 RL 时 replay buffer 由 env 循环逐 transition 填充（见 `train_gr00t_robo.py`），离线示教灌入需要先转成上述 transition 格式（参考 `examples/CR5AF/convert_to_lerobot.py` 的逆方向）。`process_droid_dataset` 仅适用于 Droid HDF5，对 LeRobot 数据无效。
 
 ### 5.2 任务配置文件
 
@@ -319,22 +321,23 @@ def get_config():
     return config
 ```
 
-### 5.3 验证数据集加载
+### 5.3 验证数据集
 
 ```bash
-cd /home/zpa/workspace/3rd/expo-ft
-source .venv/bin/activate
-
-python -c "
-from expo_ft.env.droid_utils import process_droid_dataset
-from configs.task import cr5af
-
-config = cr5af.get_config()
-dataset = process_droid_dataset('/datasets/cr5af_grasp_housing', config, num_data=5)
-print(f'Loaded {len(dataset)} episodes')
-print(f'Sample keys: {list(dataset[0].keys())}')
+# LeRobot 数据集元信息与维度核对（用 Isaac-GR00T venv，可读 parquet）
+cd ~/workspace/3rd/Isaac-GR00T
+.venv/bin/python -c "
+import json, pandas as pd
+meta = json.load(open('/datasets/cr5af_grasp_housing_l50/meta/info.json'))
+print('episodes:', meta['total_episodes'], 'fps:', meta['fps'])
+print('state shape:', meta['features']['observation.state']['shape'])
+print('action shape:', meta['features']['action']['shape'])
+df = pd.read_parquet('/datasets/cr5af_grasp_housing_l50/data/chunk-000/episode_000000.parquet')
+print('columns:', list(df.columns))
 "
 ```
+
+`state`/`action` shape 应为 `[16]`。这只是确认数据可读；要灌入 `Gr00tReplayBuffer` 仍需 transition 格式转换（见 5.1 缺口说明）。
 
 ---
 
@@ -346,8 +349,8 @@ print(f'Sample keys: {list(dataset[0].keys())}')
 
 ```python
 # --- 必须修改的字段 ---
-config.gr00t_model_path = "/path/to/your/sft/checkpoint"       # SFT 输出目录
-config.gr00t_embodiment_tag = "CR5AF_TOP_HAND"                 # Embodiment tag
+config.gr00t_model_path = "/tmp/cr5af_finetune_v5/grasp-housing-v5-l50/checkpoint-5000"  # 指向含 safetensors 的 checkpoint-<step>/
+config.gr00t_embodiment_tag = "NEW_EMBODIMENT"                 # 与 cr5af_config.py register 一致
 config.gr00t_camera_keys = ["hand_view", "table_view"]         # 相机视角
 config.gr00t_state_keys = ["eef_9d", "joint_pos", "gripper_pos"]  # 状态 key
 config.gr00t_action_keys = ["eef_9d", "joint_pos", "gripper_pos"] # 动作 key
@@ -374,7 +377,7 @@ config.use_model_lock = False       # 遇到 NaN 时设为 True
 Single-process, single-GPU variant。适合离线调试和概念验证。
 
 ```bash
-cd /home/zpa/workspace/3rd/expo-ft
+cd ~/workspace/3rd/expo-ft
 source .venv/bin/activate
 
 # 设置 GPU1 给 JAX learner
@@ -400,7 +403,7 @@ Dual-GPU async mode。Actor (主线程, GPU0) 采样，Learner (后台线程, GP
 > **重要**: 当前版本使用单进程多线程架构。Actor 推理在 GPU0 上使用 Isaac-GR00T 的 PyTorch 模型。如果需要真正的双进程分离（Actor 进程用 Isaac-GR00T venv，Learner 进程用 expo-ft venv），见 [6.4](#64-双进程分离架构实验性)。
 
 ```bash
-cd /home/zpa/workspace/3rd/expo-ft
+cd ~/workspace/3rd/expo-ft
 source .venv/bin/activate
 
 export CUDA_VISIBLE_DEVICES=0,1
@@ -442,8 +445,8 @@ python train_gr00t_robo_async.py \
 
 1. 在 Isaac-GR00T venv 中安装 expo-ft (不装 JAX):
 ```bash
-cd /home/zpa/workspace/3rd/expo-ft
-source /home/zpa/workspace/3rd/Isaac-GR00T/.venv/bin/activate
+cd ~/workspace/3rd/expo-ft
+source ~/workspace/3rd/Isaac-GR00T/.venv/bin/activate
 # 只安装 expo-ft 中 PyTorch 需要的部分
 pip install -e . --no-deps  # 然后手动装需要的
 ```
@@ -463,7 +466,7 @@ python train_gr00t_robo_async.py \
 
 ### 6.6 训练过程预期
 
-1. **启动阶段**: 加载 GR00T 模型 (~7GB, 可能需要 30-60s)，加载离线数据集。
+1. **启动阶段**: 加载 GR00T 模型 (~6GB, 可能需要 30-60s)，加载离线数据集。
 2. **预热阶段**: 前 10 个 episode 只采样不更新（warm-up）。JAX 首次编译需要 ~1-2 分钟。
 3. **训练循环**: 
    - 每个 env step: Actor 采样 action chunk，环境执行 `replan_steps` 步
@@ -492,7 +495,7 @@ python train_gr00t_robo_async.py \
 
 ### 7.2 VRAM 优化策略
 
-GR00T N1.7 模型很大 (~7B params ≈ 14GB bf16)，建议:
+GR00T N1.7-3B 模型 (~3.1B params ≈ 6GB bf16)，建议:
 
 1. **默认配置**: `freeze_gr00t_backbone=False`, `use_gradient_checkpointing=False`
    - 需要 ~24-28GB GPU 显存 (RTX 4090 边缘)
@@ -503,7 +506,7 @@ GR00T N1.7 模型很大 (~7B params ≈ 14GB bf16)，建议:
    config.use_gradient_checkpointing = True     # 减少 25-30% VRAM
    ```
 
-3. **Critic 的 image encoding**: Critic 使用自己的 ResNet encoder (不 share GR00T backbone)，所以 critic 侧不需加载 7B 模型。
+3. **Critic 的 image encoding**: Critic 使用自己的 ResNet encoder (不 share GR00T backbone)，所以 critic 侧不需加载 3B 模型。
 
 ---
 
@@ -583,10 +586,10 @@ A: 1) 确认 env server 在 8102 端口运行
 
 GR00T N1.7 基础模型目录结构:
 ```
-~/.cache/modelscope_old/nv-community/GR00T-N1___7-3B/
+~/.cache/modelscope/nv-community/GR00T-N1.7-3B/
 ├── config.json                     # HF model config
-├── model-00001-of-00002.safetensors   # 7B params, shard 1
-├── model-00002-of-00002.safetensors   # 7B params, shard 2
+├── model-00001-of-00002.safetensors   # ~3B params, shard 1
+├── model-00002-of-00002.safetensors   # ~3B params, shard 2
 ├── model.safetensors.index.json       # weight map
 ├── processor_config.json              # Processor modality + transform config
 ├── statistics.json                    # State/action normalization stats
@@ -595,3 +598,34 @@ GR00T N1.7 基础模型目录结构:
 ```
 
 SFT finetuned checkpoint 可能有不同结构（单文件 safetensors 或分片），但至少需要 `config.json` + `*.safetensors` + `processor_config.json`。
+
+---
+
+## 附录 C: 与实际仓库的对齐 / 已知审查结论
+
+### C.1 `examples/CR5AF/` 工作区（Isaac-GR00T 侧）
+
+CR5AF 的 SFT/部署/数据脚本集中在 `Isaac-GR00T/examples/CR5AF/`，本文档此前的版本未提及：
+
+| 文件 | 用途 |
+|------|------|
+| `cr5af_config.py` | 注册 `NEW_EMBODIMENT` modality（2 cam + eef_9d/joint_pos/gripper_pos，10 步 action horizon） |
+| `convert_to_lerobot.py` | 原始遥控数据 → LeRobot v2 格式 |
+| `finetune_l50.sh` | 生产级 SFT 启动脚本（lookahead=50，tune-visual + top-2 LLM） |
+| `finetune_test_ckpt.sh` | 短 run，仅为产出可加载 checkpoint 跑通 RL 代码 |
+| `train_iql_critic.py` | 状态-only IQL Critic+Value（obs/act dim=16，τ=0.7 expectile） |
+| `train_success_classifier.py` | 成功检测分类器（reward 来源） |
+| `deploy_cr5af.py` | 真机部署推理 |
+| `README.md` | CR5AF 完整 finetune/部署历史与经验 |
+
+### C.2 EXPO-FT vs IQL+QGF
+
+团队 CR5AF **当前在用的 RL 路线是 IQL Critic + QGF guidance**（状态-only，`train_iql_critic.py`），与本文档描述的 EXPO-FT（图像 critic + 残差 edit + OTF argmax-Q）是两条独立代码路径。`expo_ft/agents/alg/expo_ft_gr00t.py` 是 EXPO-FT 路径，与 IQL/QGF 未集成。选型时需明确走哪条线。
+
+### C.3 已审查的 "剩余 Issue" 结论（对照代码与论文）
+
+- **#8 `% capacity` 换行**：**诊断错误**。`sample_jax` 中 `max_start = len(self) - replan_steps`（第 436 行）已保证 `indices + replan_steps < capacity`，取模**永不触发**。跨 episode 顾虑对 critic 已被屏蔽：TD 目标第 309 行 `* masks` 屏蔽 bootstrap，critic 损失第 330 行 `* valids` 在 chunk 内 terminal 时零化样本。n-step return（第 499–506 行）是标准做法。仅 actor BC 路径动作块在 episode 末尾有低优先级缺口。
+- **奖励分类器**：expo-ft 内确实没有，但架构上 reward 由 env 服务端提供（`train_gr00t_robo.py` 第 264 行 `env.get_info_for_step()`），分类器在 `examples/CR5AF/train_success_classifier.py`。是 env 侧接线任务，非 expo-ft 缺组件。
+- **HIL**：**完整且正确**。检测（`action_type=="human"`）、标记（`is_hil`）、清除（`action_plan.clear()`）均实现；接管期间 `env.step` 返回的 `real_action`（人类实际动作）被逐 step 存入缓冲区（第 314 行），chunk 在采样时重构（Fix #7），无需"存储块替换"。
+
+> **真正的阻塞点是缺失 SFT checkpoint 权重**（v5/v6 历史run 仅存 `processor/`+`experiment_cfg/`，无 `checkpoint-<step>/`），而非 #8/HIL/奖励。

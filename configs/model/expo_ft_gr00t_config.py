@@ -58,14 +58,25 @@ def get_config():
 
     config.actor_success_only = True
 
-    # GR00T handles its own image augmentation internally via the processor;
-    # the EXPO data-augmentation pipeline (batched_openpi_augmentation) is
-    # incompatible with the GR00T critic path because it expects per-view dict
-    # keys ("base_0_rgb", "left_wrist_0_rgb") while the GR00T critic receives
-    # concatenated multi-view tensors.  Critic augmentation is a TODO — a
-    # GR00T-compatible variant that splits/transforms/re-concatenates by channel
-    # should be added in the future (paper Sec 4.3).
-    config.use_full_augmentation = False
+    # Critic image augmentation (paper Sec C.1: 95% random crop + ±5° rotation
+    # per view).  The GR00T critic receives concatenated multi-view tensors
+    # (B,H,W,3*n_views) in [0,1], so the OpenPI dict-key augmentation cannot be
+    # reused directly; ``batched_gr00t_augmentation`` splits by view, augments
+    # each, and re-concatenates.  True = crop+rotate (paper-faithful); False = off.
+    config.use_full_augmentation = True
+
+    # Sub-batch size for the batched next-action VLA forward in
+    # ``sample_batch_actions``.  Each forward processes this many next-states x N
+    # samples (= chunk * N effective batch).  8 keeps a 7.3B model within 5090
+    # VRAM; lower if OOM, higher for throughput on bigger GPUs.
+    config.gr00t_target_sample_chunk = 8
+
+    # Polyak EMA decay for a target base-VLA used in TD next-action sampling
+    # (paper Sec C.2, tau_pi=1e-3 -> 0.999).  None disables it (the online actor
+    # is used).  When set, ``sample_batch_actions`` swaps the EMA trainable params
+    # into the live model for the target forward, then restores — ~2 trainable-
+    # param copies/update; opt-in for stability.
+    config.gr00t_actor_ema_decay = None
 
     # --- GR00T modality keys (must match the embodiment's modality config) ---
     # Camera view keys in canonical order (used for critic input concatenation

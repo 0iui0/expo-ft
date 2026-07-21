@@ -10,8 +10,8 @@
 set -euo pipefail
 
 # ─── Proxy (override if your env is different) ───────────────────────────────
-export https_proxy=http://192.168.16.152:7897
-export http_proxy=http://192.168.16.152:7897
+export https_proxy=http://192.168.16.150:7897
+export http_proxy=http://192.168.16.150:7897
 
 # ─── PyTorch tuning ──────────────────────────────────────────────────────────
 export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True

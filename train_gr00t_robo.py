@@ -21,6 +21,7 @@ from ml_collections import config_flags
 
 import jax
 import etils.epath as epath
+import openpi.training.sharding as _sharding
 
 import wandb
 from expo_ft.agents import initialize_checkpoint_dir
@@ -93,9 +94,24 @@ def main(_):
     if FLAGS.gr00t_model_path:
         FLAGS.config.gr00t_model_path = FLAGS.gr00t_model_path
 
-    mesh = None  # No JAX mesh needed for GR00T (PyTorch actor)
-    data_sharding = None
-    replicated_sharding = None
+    # Mesh / sharding. Mirror the pi05 path (train_pi_robo.py) but fall back to
+    # SingleDeviceSharding on a single GPU: a (1,1) NamedSharding mesh makes the
+    # GR00T learner's eager jax.grad raise "device_assignment cannot be None" on
+    # this jaxlib build. fsdp_sharding (called inside EXPOLearner.create) treats
+    # mesh=None as single-device replication.
+    if jax.device_count() == 1:
+        mesh = None
+        _dev = jax.devices()[0]
+        data_sharding = jax.sharding.SingleDeviceSharding(_dev)
+        replicated_sharding = jax.sharding.SingleDeviceSharding(_dev)
+    else:
+        mesh = _sharding.make_mesh(FLAGS.fsdp_devices)
+        data_sharding = jax.sharding.NamedSharding(
+            mesh, jax.sharding.PartitionSpec(_sharding.DATA_AXIS)
+        )
+        replicated_sharding = jax.sharding.NamedSharding(
+            mesh, jax.sharding.PartitionSpec()
+        )
 
     log_dir = os.path.join(FLAGS.output_dir, FLAGS.run_name or "gr00t")
     os.makedirs(log_dir, exist_ok=True)

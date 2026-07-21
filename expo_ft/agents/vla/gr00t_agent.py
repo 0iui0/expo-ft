@@ -276,7 +276,12 @@ class Gr00tAgent(Model):
                 images[view] = [np.asarray(img)]
 
             # --- State: split flat array into per-key ---
+            # Add the temporal axis if missing: the GR00T processor's __call__
+            # expects per-modality state of shape (T, D), but a replay-buffer
+            # sample's state arrives as a flat (D,) vector.
             state_array = np.asarray(batch["state"][i])
+            if state_array.ndim == 1:
+                state_array = state_array[np.newaxis, :]  # (1, D)
             states = self._split_state(state_array)
 
             # --- Actions: split flat array into per-key with temporal dim ---
@@ -288,6 +293,11 @@ class Gr00tAgent(Model):
                 action_array = np.zeros(
                     (self.model_config.action_horizon, self.action_dim), dtype=np.float32
                 )
+            if action_array.ndim == 1:
+                # Flattened (C*dim,) -> (C, dim): preserve the temporal axis so
+                # _split_action yields (C, modality_dim) per key and GR00T's
+                # action_mask supervises only the C executed steps (Fix #7).
+                action_array = action_array.reshape(-1, self.action_dim)
             actions = self._split_action(action_array)
 
             # Build VLAStepData and process
@@ -314,6 +324,45 @@ class Gr00tAgent(Model):
             return x
 
         return {k: _to_device(v) for k, v in collated.items()}
+
+    def process_raw_inputs_batch(
+        self,
+        obs_list,
+        action_dim: int,
+        resize_size,
+        normalize: bool = True,
+    ):
+        """Batched ``process_raw_inputs`` for a list of raw observations (Fix #9).
+
+        ``process_observation`` natively supports batch ``B > 1`` (it tokenizes
+        all B prompts with shared padding), so a chunk of next-states is
+        processed in one call instead of B sequential single-obs calls.  Each
+        obs has ``video.<view>`` (H, W, C), ``state.<key>`` (dim,), and
+        ``prompt``.
+        """
+        modality_cfg = self._get_modality_cfg()
+        obs: Dict[str, Any] = {}
+        for view in modality_cfg["video"].modality_keys:
+            obs[f"video.{view}"] = np.stack(
+                [np.asarray(o[f"video.{view}"]) for o in obs_list]
+            )[:, np.newaxis, ...]  # (B, 1, H, W, C)
+        for key in modality_cfg["state"].modality_keys:
+            obs[f"state.{key}"] = np.stack(
+                [np.asarray(o[f"state.{key}"]).reshape(-1) for o in obs_list]
+            )[:, np.newaxis, :]  # (B, 1, dim)
+        lang_key = modality_cfg["language"].modality_keys[0]
+        obs[lang_key] = [str(o.get("prompt", "")) for o in obs_list]  # B flat strings
+
+        processed = self.processor.process_observation(obs, self.embodiment_tag)
+
+        def _to_device(x):
+            if isinstance(x, torch.Tensor) and torch.is_floating_point(x):
+                return x.to(device=self.device, dtype=self.dtype)
+            elif isinstance(x, torch.Tensor):
+                return x.to(device=self.device)
+            return x
+
+        return {k: _to_device(v) for k, v in processed.items()}
 
     # ------------------------------------------------------------------
     # Training step (PyTorch eager)
@@ -430,10 +479,12 @@ class Gr00tAgent(Model):
             elif key.startswith("state."):
                 obs[key] = np.asarray(value)[np.newaxis, np.newaxis]
 
-        # Language key
+        # Language key: process_observation iterates this as B string prompts
+        # (formalize_language lower-cases each via re.sub), so a flat list of
+        # strings is required -- not a nested [[prompt]].
         lang_key = modality_cfg["language"].modality_keys[0]
         prompt = str(raw_observations.get("prompt", ""))
-        obs[lang_key] = [[prompt]]
+        obs[lang_key] = [prompt]
 
         processed = self.processor.process_observation(obs, self.embodiment_tag)
 
@@ -516,6 +567,7 @@ class Gr00tAgent(Model):
         self,
         transformed_actions: Union[np.ndarray, torch.Tensor],
         unnormalize: bool = True,
+        state: Optional[Dict[str, np.ndarray]] = None,
     ) -> np.ndarray:
         """Decode and unnormalise model actions back to environment action space.
 
@@ -526,6 +578,13 @@ class Gr00tAgent(Model):
             transformed_actions: Model output actions, shape
                 ``(N, action_horizon, padded_dim)`` or ``(N, action_horizon, env_dim)``.
             unnormalize: If False, skip decode and just trim padding.
+            state: Optional per-modality reference state dict
+                ``{key: (N, T_state, D)}`` (raw, unnormalised) required when the
+                embodiment uses RELATIVE actions (e.g. CR5AF eef_9d/joint_pos) so
+                ``decode_action`` can convert relative deltas to absolute actions.
+                ``N`` must match ``transformed_actions.shape[0]``. Ignored when
+                ``unnormalize`` is False or the processor has ``use_relative_action``
+                disabled.
 
         Returns:
             Unnormalised flat actions, shape ``(N, action_horizon, env_action_dim)``.
@@ -539,7 +598,7 @@ class Gr00tAgent(Model):
             env_horizon = len(self._get_modality_cfg()["action"].delta_indices)
             return arr[:, :env_horizon, : self.action_dim]
 
-        decoded = self.processor.decode_action(arr, self.embodiment_tag, state=None)
+        decoded = self.processor.decode_action(arr, self.embodiment_tag, state=state)
         flat = self._concat_action(decoded)
         return flat.astype(np.float32)
 
@@ -719,10 +778,11 @@ def build_gr00t(config, seed, mesh, data_sharding, replicated_sharding, resume, 
         dtype=torch.bfloat16,
         lr=config.get("actor_lr", 1e-5),
         weight_decay=config.get("weight_decay", 1e-5),
-        # No actor EMA on the GR00T path: the trainable (selective-unfreeze)
-        # subset is ~1.5B, so an EMA copy + per-inference online/EMA swap would
-        # be prohibitive, and EXPO's OTF uses the online policy anyway.
-        ema_decay=None,
+        # Target base-VLA EMA for TD next-action sampling (paper Sec C.2,
+        # tau_pi).  None disables it (the online actor is used, current
+        # default); 0.999 ~= tau_pi=1e-3 and enables a target forward via
+        # ``PyTorchTrainState.run_with_ema``.
+        ema_decay=config.get("gr00t_actor_ema_decay", None),
     )
 
     # Base-VLA target EMA is unused on the GR00T EXPO path (OTF/next-action
@@ -737,6 +797,12 @@ def build_gr00t(config, seed, mesh, data_sharding, replicated_sharding, resume, 
     if config.get("use_model_lock", False):
         actor.enable_model_lock(True)
 
+    # Config knobs consumed by EXPOLearnerGR00T through the actor instance
+    # (the agent is a flax struct, so plain attributes on the non-struct
+    # Gr00tAgent are the simplest channel).
+    actor.gr00t_critic_aug_full = bool(config.get("use_full_augmentation", True))
+    actor.gr00t_target_sample_chunk = int(config.get("gr00t_target_sample_chunk", 8))
+
     metadata = dict(
         action_horizon=len(
             actor._get_modality_cfg()["action"].delta_indices
@@ -745,4 +811,43 @@ def build_gr00t(config, seed, mesh, data_sharding, replicated_sharding, resume, 
         freeze_encoder=False,
     )
 
-    return actor, actor_train_state, target_actor_params, {}, metadata
+    # Plumb the EXPO hyperparameters from the model config into the learner.
+    # (Returning {} here previously left every config knob dead: the agent was
+    # always built with EXPOLearner.create's defaults -- N=32, num_qs=2,
+    # n_edit_samples=0, latent_dim_image=50, actor_success_only=False -- ignoring
+    # the paper/config-tuned values below.)
+    agent_kwargs = dict(
+        N=config.get("N", 32),
+        n_edit_samples=config.get("n_edit_samples", 0),
+        num_qs=config.get("num_qs", 2),
+        num_min_qs=config.get("num_min_qs", None),
+        critic_layer_norm=config.get("critic_layer_norm", False),
+        critic_dropout_rate=config.get("critic_dropout_rate", None),
+        critic_weight_decay=config.get("critic_weight_decay", None),
+        use_critic_resnet=config.get("use_critic_resnet", False),
+        use_pnorm=config.get("use_pnorm", False),
+        hidden_dims=tuple(config.get("hidden_dims", (256, 256))),
+        latent_dim_image=config.get("latent_dim_image", 50),
+        latent_dim_state=config.get("latent_dim_state", 50),
+        include_state=config.get("include_state", True),
+        encoder_stage_sizes=tuple(config.get("encoder_stage_sizes", (2, 2, 2, 2))),
+        encoder_num_filters=config.get("encoder_num_filters", 64),
+        actor_lr=config.get("actor_lr", 3e-4),
+        critic_lr=config.get("critic_lr", 3e-4),
+        temp_lr=config.get("temp_lr", 3e-4),
+        edit_scale=config.get("edit_scale", 1.0),
+        actor_drop=config.get("actor_drop", None),
+        actor_tau=config.get("actor_tau", 1e-3),
+        adjust_target_entropy=config.get("adjust_target_entropy", False),
+        entropy_scale=config.get("entropy_scale", 1.0),
+        init_temperature=config.get("init_temperature", 1.0),
+        batch_split=config.get("batch_split", 1),
+        encode_batch_split=config.get("encode_batch_split", 1),
+        discount=config.get("discount", 0.99),
+        tau=config.get("tau", 0.005),
+        freeze_critic_encoder=config.get("freeze_critic_encoder", False),
+        actor_success_only=config.get("actor_success_only", False),
+        use_full_augmentation=config.get("use_full_augmentation", True),
+    )
+
+    return actor, actor_train_state, target_actor_params, agent_kwargs, metadata

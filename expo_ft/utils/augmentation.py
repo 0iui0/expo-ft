@@ -100,3 +100,37 @@ def make_data_augmentation_fn(
         return batched_crop_only_augmentation(rng, image_dict)
 
     return data_augmentation_fn
+
+
+def batched_gr00t_augmentation(rng, obs_concat: jnp.ndarray, n_views: int = 2, full: bool = True) -> jnp.ndarray:
+    """Augment a concatenated multi-view critic observation.
+
+    ``obs_concat`` is ``(B, H, W, 3 * n_views)`` float32 in ``[0, 1]`` (the
+    format the GR00T critic encoder receives from ``prepare_gr00t_critic_batch``).
+    Each view is split off by channel, augmented with an independent per-sample
+    random draw (95% random crop + ±5° rotation, plus color jitter when
+    ``full``), then re-concatenated.  Paper Sec C.1.
+
+    Unlike ``batched_openpi_augmentation`` (which works on a per-view dict in
+    ``[-1, 1]``), this operates directly on the concatenated ``[0, 1]`` tensor,
+    so no range conversion is needed.
+    """
+    B = obs_concat.shape[0]
+    height, width = obs_concat.shape[1], obs_concat.shape[2]
+    views = [obs_concat[..., i * 3:(i + 1) * 3] for i in range(n_views)]
+
+    transforms = [
+        augmax.RandomCrop(int(width * 0.95), int(height * 0.95)),
+        augmax.Resize(width, height),
+        augmax.Rotate((-5, 5)),
+    ]
+    if full:
+        transforms.append(augmax.ColorJitter(brightness=0.1, contrast=0.1, saturation=0.1))
+    chain = augmax.Chain(*transforms)
+
+    sub_rngs = jax.random.split(rng, n_views * B)
+    out_views = []
+    for v in range(n_views):
+        v_rngs = sub_rngs[v * B:(v + 1) * B]
+        out_views.append(jax.vmap(chain)(v_rngs, views[v]))
+    return jnp.concatenate(out_views, axis=-1)

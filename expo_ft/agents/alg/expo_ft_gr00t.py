@@ -38,6 +38,7 @@ from expo_ft.agents.alg.expo_ft import (
 from expo_ft.data.dataset import DatasetDict
 from expo_ft.data.gr00t_replay_buffer import prepare_gr00t_critic_batch
 from expo_ft.networks import subsample_image_ensemble
+from expo_ft.utils.augmentation import batched_gr00t_augmentation
 
 
 def load_agent(
@@ -120,7 +121,19 @@ class EXPOLearnerGR00T(EXPOLearner):
         transformed_actions, sample_time = self.actor.sample_actions(
             transformed_inputs, _actor_train_state, key, train=False, num_samples=self.N
         )
-        raw_actions = jnp.asarray(self.actor.process_transformed_outputs(transformed_actions))
+        # Reference state for RELATIVE->absolute decode (CR5AF eef_9d/joint_pos),
+        # tiled to the N samples -- they all come from the same current obs.
+        _n = transformed_actions.shape[0]
+        _ref_state = {
+            _k: np.tile(
+                np.asarray(observations[f"state.{_k}"]).reshape(-1)[None, None, :],
+                (_n, 1, 1),
+            )
+            for _k in self.actor._state_keys
+        }
+        raw_actions = jnp.asarray(
+            self.actor.process_transformed_outputs(transformed_actions, state=_ref_state)
+        )
 
         if only_base_actions:
             action = raw_actions[0].reshape(self.action_horizon, self.action_dim)
@@ -179,61 +192,109 @@ class EXPOLearnerGR00T(EXPOLearner):
     # TD-target next-action sampling (hoisted out of the UTD loop)
     # ------------------------------------------------------------------
     def sample_batch_actions(self, batch):
-        """OTF-select the next action for each next-state in ``batch``.
+        """OTF-select the next action for each next-state in ``batch`` (Fix #9).
 
-        Returns ``(next_actions (B, full_action_dim), info, new_rng)``. Called
-        ONCE per update (decision B) so the VLA forward is not repeated UTD
-        times. Per-state loop is correct; batching/chunking is a B6 concern.
+        Returns ``(next_actions (B, full_action_dim), info, new_rng)``.  Called
+        ONCE per update.  All ``n_next`` next-states go through a single
+        sub-batched VLA forward (``chunk`` next-states x N samples per call) and
+        the OTF argmax-Q selection is fully vectorized -- replacing the prior
+        per-state Python loop (64 sequential VLA forwards).  When a base-VLA
+        target EMA is configured (Fix #4) the forward runs under the EMA params.
         """
         rng = self.rng
+        N = self.N
         n_next = batch["next_state"].shape[0]
-        selected = []
+        chunk = getattr(self.actor, "gr00t_target_sample_chunk", None) or n_next
+
+        # 1. Per-next-state raw obs + critic obs/state (cheap, no VLA forward).
+        obs_list, critic_obs_np, critic_state_np = [], [], []
         for i in range(n_next):
             images = {v: np.asarray(batch["next_image"][v][i]) for v in self.actor._video_keys}
             flat_state = np.asarray(batch["next_state"][i])
             obs = self.actor.build_obs_dict(images, flat_state, batch["prompt"][i])
-            tin = self.actor.process_raw_inputs(obs, self.action_dim, self.resize_size)
+            obs_list.append(obs)
+            co, cs = self.actor.critic_inputs_from_observation(obs)
+            critic_obs_np.append(co[0])
+            critic_state_np.append(cs[0])
 
+        # 2. Sub-batched VLA forward: ``chunk`` next-states x N samples per call
+        #    (chunk*N effective batch; VRAM-bounded on smaller GPUs).
+        base_chunks = []
+        # Per-key reference state for RELATIVE->absolute decode, accumulated to
+        # match each chunk's tacts ordering (see below).
+        ref_state_chunks = {k: [] for k in self.actor._state_keys}
+        for s in range(0, n_next, chunk):
+            sub = obs_list[s:s + chunk]
+            tin = self.actor.process_raw_inputs_batch(
+                sub, self.action_dim, self.resize_size
+            )
             key, rng = jax.random.split(rng)
-            tacts, _ = self.actor.sample_actions(
-                tin, self.actor_train_state, key, train=False, num_samples=self.N
-            )
-            raw_base = self.actor.process_transformed_outputs(tacts)
-            base_actions = raw_base[:, : self.replan_steps, :].reshape(self.N, self.full_action_dim)
-
-            critic_obs_np, critic_state_np = self.actor.critic_inputs_from_observation(obs)
-            critic_obs = jnp.asarray(critic_obs_np.astype(np.float32) / 255.0)
-            critic_state = jnp.asarray(critic_state_np)
-            encoded = batch_encode(
-                self.batch_encoder.apply_fn, self.batch_encoder.params, critic_obs,
-                stop_gradient=True,
-            )
-
-            if self.n_edit_samples > 0:
-                key, rng = jax.random.split(rng, 2)
-                r_obs = jnp.repeat(encoded, self.n_edit_samples, axis=0)
-                r_states = jnp.repeat(critic_state, self.n_edit_samples, axis=0)
-                r_samples, _, rng = self._sample_residual(
-                    key, self.residual_actor.params, r_obs, r_states, base_actions[: self.n_edit_samples]
+            tacts, _ = self.actor_train_state.run_with_ema(
+                lambda: self.actor.sample_actions(
+                    tin, self.actor_train_state, key, train=False, num_samples=N
                 )
-                candidates = jnp.concatenate([base_actions, r_samples], axis=0)
-            else:
-                candidates = base_actions
+            )
+            base_chunks.append(np.asarray(tacts))  # (len(sub)*N, H, env_dim)
+            # sample_actions tiles each input N x via ``v.repeat(N, 1, ...)`` ->
+            # [full sub] * N concatenated (interleaved), so the reference state is
+            # ``np.tile(sub_st, (N, 1))`` to land on the same sample indices.
+            for _k in self.actor._state_keys:
+                sub_st = np.stack(
+                    [np.asarray(o[f"state.{_k}"]).reshape(-1) for o in sub]
+                )  # (len(sub), D)
+                ref_state_chunks[_k].append(
+                    np.tile(sub_st, (N, 1))[:, np.newaxis, :]
+                )  # (len(sub)*N, 1, D)
 
-            n_cand = candidates.shape[0]
-            enc_rep = jnp.repeat(encoded, n_cand, axis=0)
-            state_rep = jnp.repeat(critic_state, n_cand, axis=0)
-            key, rng = jax.random.split(rng)
-            target_params = subsample_image_ensemble(
-                key, self.target_critic.params, self.num_min_qs, self.num_qs
+        all_tacts = np.concatenate(base_chunks, axis=0)  # (n_next*N, H, env_dim)
+        ref_state = {
+            _k: np.concatenate(ref_state_chunks[_k], axis=0)  # (n_next*N, 1, D)
+            for _k in self.actor._state_keys
+        }
+        raw_base = self.actor.process_transformed_outputs(all_tacts, state=ref_state)  # decoded
+        H = raw_base.shape[1]
+        raw_base = raw_base.reshape(n_next, N, H, raw_base.shape[-1])
+        base_actions = raw_base[:, :, :self.replan_steps, :].reshape(n_next, N, self.full_action_dim)
+
+        # 3. Vectorized critic encoding + OTF argmax-Q over (n_next, n_cand).
+        critic_obs = jnp.asarray(np.stack(critic_obs_np).astype(np.float32) / 255.0)
+        critic_state = jnp.asarray(np.stack(critic_state_np))
+        encoded = batch_encode(
+            self.batch_encoder.apply_fn, self.batch_encoder.params, critic_obs,
+            stop_gradient=True,
+        )  # (n_next, enc)
+
+        if self.n_edit_samples > 0:
+            key, rng = jax.random.split(rng, 2)
+            r_obs = jnp.repeat(encoded, self.n_edit_samples, axis=0)
+            r_states = jnp.repeat(critic_state, self.n_edit_samples, axis=0)
+            base_for_edit = base_actions[:, :self.n_edit_samples, :].reshape(
+                n_next * self.n_edit_samples, self.full_action_dim
             )
-            qs = compute_q(
-                self.target_critic.apply_fn, target_params, enc_rep, candidates, state_rep,
-                self.num_min_qs,
+            r_samples, _, rng = self._sample_residual(
+                key, self.residual_actor.params, r_obs, r_states, base_for_edit
             )
-            selected.append(candidates[jnp.argmax(qs)])
+            r_samples = r_samples.reshape(n_next, self.n_edit_samples, self.full_action_dim)
+            candidates = jnp.concatenate([base_actions, r_samples], axis=1)  # (n_next, N+n_edit)
+        else:
+            candidates = base_actions  # (n_next, N)
+
+        n_cand = candidates.shape[1]
+        enc_rep = jnp.repeat(encoded, n_cand, axis=0)
+        state_rep = jnp.repeat(critic_state, n_cand, axis=0)
+        cand_flat = candidates.reshape(n_next * n_cand, self.full_action_dim)
+        key, rng = jax.random.split(rng)
+        target_params = subsample_image_ensemble(
+            key, self.target_critic.params, self.num_min_qs, self.num_qs
+        )
+        qs = compute_q(
+            self.target_critic.apply_fn, target_params, enc_rep, cand_flat, state_rep,
+            self.num_min_qs,
+        ).reshape(n_next, n_cand)
+        best = jnp.argmax(qs, axis=1)
+        selected = candidates[jnp.arange(n_next), best]  # (n_next, full_action_dim)
         rng, _ = jax.random.split(rng, 2)
-        return jnp.stack(selected), {}, rng
+        return selected, {}, rng
 
     # ------------------------------------------------------------------
     # Critic update (consumes precomputed next-actions; no actor call inside)
@@ -244,14 +305,19 @@ class EXPOLearnerGR00T(EXPOLearner):
 
         # Use pre-computed observations/next_observations from
         # prepare_gr00t_critic_batch (concatenated float32 [0,1]).
-        # Data augmentation (paper Sec 4.3) for the GR00T critic path is
-        # TODO: the OpenPI augmentation functions expect per-view dict keys
-        # ("base_0_rgb", "left_wrist_0_rgb"), while GR00T critic observations
-        # are concatenated (B, H, W, 3*n_views). A GR00T-compatible
-        # augmentation that splits by channel, augments each view
-        # independently, and re-concatenates should be added here.
         obs = batch["observations"]
         next_obs = batch["next_observations"]
+
+        # GR00T-compatible critic augmentation (paper Sec C.1, Fix #3): crop +
+        # rotation (+ color jitter) per view on the concatenated [0,1] tensor,
+        # with independent draws for obs and next_obs.  Disabled when
+        # ``use_full_augmentation`` is False (actor.gr00t_critic_aug_full).
+        if getattr(self.actor, "gr00t_critic_aug_full", True):
+            _nv = len(self.actor._video_keys)
+            key, rng = jax.random.split(rng)
+            obs = batched_gr00t_augmentation(key, obs, n_views=_nv, full=True)
+            key, rng = jax.random.split(rng)
+            next_obs = batched_gr00t_augmentation(key, next_obs, n_views=_nv, full=True)
 
         key, rng = jax.random.split(rng)
         target_params = subsample_image_ensemble(
@@ -379,15 +445,9 @@ class EXPOLearnerGR00T(EXPOLearner):
         last_minibatch = jax.tree_util.tree_map(lambda x: sel(x, -1), minibatches)
 
         if self.actor_success_only and actor_batch is not None:
-            actor_batch = prepare_gr00t_critic_batch(
-                actor_batch.copy(),
-                camera_keys=self.actor._video_keys,
-                padded_dim=self.actor.model_config.action_dim,
-                action_dim=self.action_dim,
-                state_dim=self.state_dim,
-                action_horizon=self.action_horizon,
-                replan_steps=self.replan_steps,
-            )
+            # Actor BC consumes the RAW 3-D executed action chunk (Fix #7); do
+            # not flatten it via prepare_gr00t_critic_batch (critic/residual
+            # format).  GR00T's action_mask supervises only the C executed steps.
             new_agent, actor_info = new_agent.update_actor(actor_batch)
         else:
             new_agent, actor_info = new_agent.update_actor(last_minibatch)

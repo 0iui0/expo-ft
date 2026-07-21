@@ -110,6 +110,28 @@ class PyTorchTrainState:
         }
         return dataclasses.replace(self, ema_params=new_ema)
 
+    def run_with_ema(self, fn):
+        """Run ``fn`` with the EMA (target) trainable params in the live model.
+
+        Used by ``sample_batch_actions`` to draw TD next-actions from the target
+        base-VLA (paper Sec C.2, tau_pi).  No-op when EMA is disabled.  Saves the
+        online trainable params, swaps the EMA in, runs ``fn``, and restores the
+        online params in a ``finally``.  In async mode the caller must hold the
+        model lock so the swap is not observed mid-forward by the actor thread.
+        """
+        if self.ema_params is None or self.ema_decay is None:
+            return fn()
+        online = {
+            n: p.detach().clone()
+            for n, p in self.model.named_parameters()
+            if p.requires_grad
+        }
+        self.load_params_into_model(self.ema_params)
+        try:
+            return fn()
+        finally:
+            self.load_params_into_model(online)
+
     # ------------------------------------------------------------------
     # Checkpoint serialization (CPU offload for orbax compatibility)
     # ------------------------------------------------------------------

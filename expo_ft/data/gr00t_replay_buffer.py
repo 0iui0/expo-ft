@@ -69,21 +69,17 @@ def prepare_gr00t_critic_batch(
     batch["critic_states"] = batch["states"]
     batch["next_critic_states"] = batch["next_states"]
 
-    # Handle both padded and raw action formats
+    # Actions arrive as the reconstructed executed chunk
+    # (B, replan_steps, env_action_dim) from ``sample_jax`` (Fix #7). Trim to the
+    # env action dim; the critic and residual actor consume the flattened C-step
+    # chunk of shape (B, replan_steps * action_dim).  ``padded_dim`` /
+    # ``action_horizon`` are retained in the signature for call-site compatibility
+    # but no longer drive the reshape (the chunk length is already replan_steps).
     raw_actions = batch["actions"]
-    if raw_actions.shape[-1] >= padded_dim:
-        # Already padded — extract env dim
-        actions_unpadded = raw_actions.reshape(batch_size, action_horizon, padded_dim)[..., :action_dim]
-    else:
-        # Raw format — use as-is
-        env_dim = raw_actions.shape[-1]
-        assert env_dim == action_dim, (
-            f"Raw action dim {env_dim} does not match expected action_dim {action_dim}"
-        )
-        actions_unpadded = raw_actions.reshape(batch_size, action_horizon, action_dim)
-
-    batch["full_actions"] = actions_unpadded.reshape(batch_size, action_horizon * action_dim)
-    batch["actions"] = actions_unpadded[:, :replan_steps, :].reshape(batch_size, replan_steps * action_dim)
+    actions_unpadded = raw_actions[..., :action_dim]  # (B, replan_steps, action_dim)
+    batch["actions"] = actions_unpadded.reshape(batch_size, replan_steps * action_dim)
+    # full_actions is unused on the GR00T path; keep shape-consistent for safety.
+    batch["full_actions"] = batch["actions"]
 
     return batch
 
@@ -474,6 +470,37 @@ class Gr00tReplayBuffer(Dataset):
             batch["image"][view] = self.dataset_dict[f"image_{view}"][indices]
             batch["image_mask"][view] = self.dataset_dict[f"image_mask_{view}"][indices]
             batch[f"image_{view}"]  # keep flat key in _buffer_keys listing
+
+        # Reconstruct the TRUE executed C-step action chunk (Fix #7).
+        # Every slot stores a single per-step action (online env steps and
+        # per-step offline demos both insert one action), so reading the first
+        # action of C consecutive slots yields the actually-executed chunk
+        # a_{t:t+C} -- instead of the degenerate tiled [a_t] x H that the
+        # generic gather above produced.  Symmetric with the multi-step reward
+        # accumulation below.
+        _np_idx = np.asarray(indices)
+        _adim = self._env_action_dim
+        _chunk_actions = np.stack([
+            self.dataset_dict["actions"][(_np_idx + k) % self._capacity][:, 0, :_adim]
+            for k in range(self._replan_steps)
+        ], axis=1)  # (B, replan_steps, env_action_dim)
+
+        # Hold the last in-episode action after a terminal so the reconstructed
+        # chunk never concatenates the NEXT episode's actions (Fix #8, actor-BC
+        # path).  The critic is already shielded -- `valids` zeros its loss and
+        # `masks` zeroes the bootstrap when a terminal falls in the chunk -- so
+        # this only protects success-only actor supervision near episode ends.
+        _dones_chunk = np.stack([
+            self.dataset_dict["dones"][(_np_idx + k) % self._capacity]
+            for k in range(self._replan_steps)
+        ], axis=1)  # (B, replan_steps)
+        _has_done = _dones_chunk.any(axis=1)
+        _first_done = np.argmax(_dones_chunk, axis=1)  # first True per row
+        for b in np.flatnonzero(_has_done):
+            d = int(_first_done[b])
+            if d + 1 < self._replan_steps:
+                _chunk_actions[b, d + 1:] = _chunk_actions[b, d]
+        batch["actions"] = _chunk_actions
 
         next_idx = (indices + self._replan_steps) % self._capacity
 

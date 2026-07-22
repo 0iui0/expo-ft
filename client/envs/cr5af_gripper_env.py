@@ -169,11 +169,12 @@ class CR5AFGripperEnv:
         pipe = rs.pipeline()
         cfg = rs.config()
         cfg.enable_device(serial)
-        cfg.enable_stream(rs.stream.color, image_size[1], image_size[0],
-                          rs.format.rgb8, 30)
-        pipe.start(cfg)
-        # let auto-exposure settle
-        for _ in range(15):
+        # Capture at native 640x480 (256x256 is below RealSense min resolution),
+        # resize to image_size in _read_camera.
+        cfg.enable_stream(rs.stream.color, 640, 480, rs.format.rgb8, 30)
+        profile = pipe.start(cfg)
+        # Let auto-exposure settle
+        for _ in range(30):
             pipe.wait_for_frames()
         return pipe
 
@@ -366,6 +367,10 @@ class CR5AFGripperEnv:
             return np.zeros((*self._image_size, 3), dtype=np.uint8)
         frames = cam.wait_for_frames()
         img = np.asanyarray(frames.get_color_frame().get_data())
+        h, w = self._image_size
+        if img.shape[0] != h or img.shape[1] != w:
+            import cv2
+            img = cv2.resize(img, (w, h))
         return img
 
     def get_observation(self) -> Dict[str, Any]:

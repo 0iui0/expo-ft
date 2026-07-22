@@ -30,9 +30,9 @@ def get_config():
     config.speed = 50.0  # motion speed percentage (0-100)
     config.translation_only = False
 
-    # ── cameras (fill in the RealSense serials for hand + table cameras) ──
-    config.camera_serial_hand = ""
-    config.camera_serial_table = ""
+    # ── cameras ──────────────────────────────────────────────────────────
+    config.camera_serial_hand = "260322277798"   # D405 wrist camera
+    config.camera_serial_table = "333422302713"  # D455 table camera
 
     # ── observation ────────────────────────────────────────────────────────
     config.image_size = (256, 256)

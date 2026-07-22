@@ -126,6 +126,18 @@ class CR5AFGripperEnv:
         self._cam_table = None
         try:
             import pyrealsense2 as rs
+            # Auto-detect if serials are empty (like record_demo_gripper.py)
+            if not camera_serial_hand or not camera_serial_table:
+                ctx = rs.context()
+                for dev in ctx.devices:
+                    name = dev.get_info(rs.camera_info.name)
+                    sn = dev.get_info(rs.camera_info.serial_number)
+                    if "455" in name and not camera_serial_table:
+                        camera_serial_table = sn
+                    elif "405" in name and not camera_serial_hand:
+                        camera_serial_hand = sn
+                logger.info("Auto-detected cameras: hand=%s table=%s",
+                            camera_serial_hand, camera_serial_table)
             if camera_serial_hand:
                 self._cam_hand = self._init_realsense(rs, camera_serial_hand, image_size)
             if camera_serial_table:

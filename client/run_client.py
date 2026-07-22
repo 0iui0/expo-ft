@@ -13,7 +13,7 @@ from typing import Dict, Any, Optional
 import numpy as np
 import websockets
 import websockets.asyncio.server as _server
-from openpi_client import msgpack_numpy
+import msgpack_numpy
 
 os.environ["TOKENIZERS_PARALLELISM"] = "false"
 os.environ['PYOPENGL_PLATFORM'] = 'egl'

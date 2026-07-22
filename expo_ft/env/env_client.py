@@ -7,7 +7,7 @@ from typing import Dict, Tuple, Any
 import numpy as np
 import websockets.sync.client
 import websockets.exceptions
-from openpi_client import msgpack_numpy
+import msgpack_numpy
 
 # Handshake/connection errors that can occur over SSH reverse tunnels (connection
 # accepted but closed before/during HTTP response). Direct connection often avoids these.

@@ -8,12 +8,21 @@ import asyncio
 import dataclasses
 import logging
 import os
+import sys
+from pathlib import Path
 from typing import Dict, Any, Optional
 
 import numpy as np
 import websockets
 import websockets.asyncio.server as _server
 import msgpack_numpy
+
+# Ensure the project root (parent of client/) is on sys.path so that
+# configs.* and client.* are importable regardless of how the server
+# process is launched (nohup, systemd, etc.).
+_PROJECT_ROOT = Path(__file__).resolve().parent.parent
+if str(_PROJECT_ROOT) not in sys.path:
+    sys.path.insert(0, str(_PROJECT_ROOT))
 
 os.environ["TOKENIZERS_PARALLELISM"] = "false"
 os.environ['PYOPENGL_PLATFORM'] = 'egl'
@@ -24,11 +33,11 @@ def load_task_config(config_path: Optional[str]):
     """Load task config from module path, similar to config_flags.DEFINE_config_file."""
     if config_path is None:
         return None
-    
+
     # Convert file path to module path if needed (e.g., "configs/task/pick.py" -> "configs.task.pick")
     if '/' in config_path or '.py' in config_path:
         config_path = config_path.replace('.py', '').replace('/', '.')
-    
+
     try:
         module = __import__(config_path, fromlist=['get_config'])
         return module.get_config()

@@ -58,9 +58,15 @@ GRIPPER_IDX = 15
 
 def _rot6d_to_matrix(rot6d: np.ndarray) -> np.ndarray:
     """rot6d (two 3-vectors) → 3x3 rotation matrix (Gram-Schmidt)."""
-    a = rot6d[:3] / np.linalg.norm(rot6d[:3])
+    a_norm = np.linalg.norm(rot6d[:3])
+    if a_norm < 1e-8:
+        return np.eye(3, dtype=rot6d.dtype)
+    a = rot6d[:3] / a_norm
     b = rot6d[3:6] - np.dot(a, rot6d[3:6]) * a
-    b /= np.linalg.norm(b)
+    b_norm = np.linalg.norm(b)
+    if b_norm < 1e-8:
+        return np.eye(3, dtype=rot6d.dtype)
+    b /= b_norm
     c = np.cross(a, b)
     return np.column_stack([a, b, c])
 
@@ -139,9 +145,15 @@ class CR5AFGripperEnv:
                 logger.info("Auto-detected cameras: hand=%s table=%s",
                             camera_serial_hand, camera_serial_table)
             if camera_serial_hand:
-                self._cam_hand = self._init_realsense(rs, camera_serial_hand, image_size)
+                try:
+                    self._cam_hand = self._init_realsense(rs, camera_serial_hand, image_size)
+                except Exception as e:
+                    logger.warning("D405 hand camera init failed (%s), using black frames.", e)
             if camera_serial_table:
-                self._cam_table = self._init_realsense(rs, camera_serial_table, image_size)
+                try:
+                    self._cam_table = self._init_realsense(rs, camera_serial_table, image_size)
+                except Exception as e:
+                    logger.warning("D455 table camera init failed (%s), using black frames.", e)
         except ImportError:
             logger.warning("pyrealsense2 not available — camera frames will be empty.")
 

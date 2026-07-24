@@ -93,6 +93,7 @@ class CR5AFGripperEnv:
         camera_serial_table: str = "",
         speed: float = 50.0,
         translation_only: bool = False,
+        control_hz: float = 30.0,
         language_instruction: str = "grasp motor shaft and insert into bushing",
         video_dir: str = "",
         **kwargs,
@@ -105,6 +106,7 @@ class CR5AFGripperEnv:
         self._translation_only = translation_only
         self._language_instruction = language_instruction
         self._servo_gain = 250  # lower = softer (default 250, range 200-1000)
+        self._dt = 1.0 / control_hz  # step period for ServoP velocity scaling
 
         # ── thread-safe state cache (SI units) ─────────────────────────────
         self._lock = threading.Lock()
@@ -428,7 +430,7 @@ class CR5AFGripperEnv:
         rxyz_delta_deg = R.from_matrix(R_delta).as_euler("XYZ", degrees=True)
 
         # scale to velocity
-        dt = 0.1  # step period in seconds (10 Hz control)
+        dt = self._dt  # step period in seconds (1/control_hz)
         vel_mm = pos_delta_mm / dt
         vel_deg = rxyz_delta_deg / dt
 

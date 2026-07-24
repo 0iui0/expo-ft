@@ -41,6 +41,25 @@ from tqdm import tqdm
 
 from lerobot.common.datasets.lerobot_dataset import HF_LEROBOT_HOME, LeRobotDataset
 
+# datasets 3.x + numpy 2.x: LeRobot maps a shape-(1,) float feature to a scalar
+# ``datasets.Value``, whose ``encode_example`` calls ``float(value)`` -- numpy>=2
+# rejects (1,) ndarrays. LeRobot's ``validate_frame`` simultaneously requires a
+# (1,) ndarray for shape-(1,) features, so 0-d won't pass either. Unwrap size-1
+# ndarrays before the default encoder so (1,) gripper values encode as scalars.
+import datasets.features.features as _dsf  # noqa: E402
+
+_orig_value_encode = _dsf.Value.encode_example
+
+
+def _value_encode_unwrap(self, value):
+    if isinstance(value, np.ndarray) and value.size == 1:
+        value = value.item()
+    return _orig_value_encode(self, value)
+
+
+_dsf.Value.encode_example = _value_encode_unwrap
+
+
 # Image storage resolution. Recordings are 240x320; keep native to avoid distortion.
 # Model transforms resize to 224x224 internally, so storage resolution is flexible.
 IMG_H, IMG_W = 240, 320
@@ -132,8 +151,8 @@ def main(
             "gripper_position": {"dtype": "float32", "shape": (1,), "names": ["gripper_position"]},
             "actions": {"dtype": "float32", "shape": (7,), "names": ["actions"]},
         },
-        image_writer_threads=10,
-        image_writer_processes=5,
+        image_writer_threads=4,
+        image_writer_processes=0,
     )
 
     n_written = 0
@@ -159,7 +178,7 @@ def main(
                 "exterior_image_2_left": _resize_image(imgs_table[t]),
                 "wrist_image_left": _resize_image(imgs_hand[t]),
                 "cartesian_position": cartesian[t],
-                "gripper_position": grip[t],
+                "gripper_position": grip[t],  # (1,) float32; encode_unwrap handles the scalar mapping
                 "actions": actions[t],
                 "task": task,
             })

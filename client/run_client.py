@@ -231,7 +231,7 @@ async def _handle_environment_request(websocket: _server.ServerConnection):
                                 #   target = cur_xyz + tdelta
                                 # action_6d values are normalised [-1, 1]; grip is 0/1.
                                 obs = env.get_observation()
-                                cur_xyz = obs["state.eef_9d"][:3]       # mm
+                                cur_xyz_mm = obs["state.eef_9d"][:3]   # mm
                                 cur_rot6d = obs["state.eef_9d"][3:9]
                                 cur_joints = obs["state.joint_pos"]
                                 # Per-step scale (mm/unit/step). record_demo uses
@@ -244,7 +244,7 @@ async def _handle_environment_request(websocket: _server.ServerConnection):
                                     ty * action_scale,
                                     -tz * action_scale,   # match reference: -tz
                                 ])
-                                new_xyz = cur_xyz + tdelta
+                                new_xyz = cur_xyz_mm + tdelta
                                 # Rotation: hold current
                                 new_eef_9d = np.concatenate([new_xyz, cur_rot6d]).astype(np.float64)
                                 # Gripper: action_7d[6] is already 0.0/1.0 from toggle

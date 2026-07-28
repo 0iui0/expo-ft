@@ -40,6 +40,7 @@ FLAGS = flags.FLAGS
 flags.DEFINE_string("project_name", "expo-ft-gr00t", "wandb project name.")
 flags.DEFINE_string("run_name", None, "Optional wandb run name.")
 flags.DEFINE_float("offline_ratio", 0.0, "Offline batch fraction; 0 inserts dataset into online replay buffer.")
+flags.DEFINE_string("deploy_inference", "", "Use deploy inference server at host:port (e.g. 'localhost:5555') instead of local GR00T inference.")
 flags.DEFINE_integer("seed", 42, "Random seed.")
 flags.DEFINE_enum("update_type", "episode", ["episode", "step", "batch"], "When to run gradient updates.")
 flags.DEFINE_integer("num_updates", 1, "Number of gradient updates per trigger.")
@@ -83,6 +84,7 @@ config_flags.DEFINE_config_file(
 
 
 def main(_):
+    global _deploy_socket
     init_logging()
 
     jax.config.update(
@@ -247,13 +249,23 @@ def main(_):
     )
     logging.info("Resuming: ep_count set to %d", training_log.ep_count)
 
+    # If --deploy_inference is set, connect to the deploy inference server
+    # (Gr00tPolicy on GPU0, port 5555) so rollout actions exactly match deploy.
+    _deploy_socket = None
+    if FLAGS.deploy_inference:
+        import zmq
+        _deploy_socket = zmq.Context().socket(zmq.REQ)
+        _deploy_socket.connect(f"tcp://{FLAGS.deploy_inference}")
+        _deploy_socket.setsockopt(zmq.RCVTIMEO, 5000)
+        _deploy_socket.setsockopt(zmq.SNDTIMEO, 1000)
+        logging.info("Using deploy inference server at %s", FLAGS.deploy_inference)
+
     batch_processor.on_episode_start()
 
     dt = 1.0 / FLAGS.config_task.control_hz
     done = False
     env.reset()
     start_step_time = time.time()
-    env.step(FLAGS.config_task.example_action.squeeze().tolist())
     action_plan = deque()
     action_type = "policy"
     episodes_since_update = 0
@@ -292,7 +304,38 @@ def main(_):
 
         if not action_plan and action_type != "human":
             sample_start = time.time()
-            action_chunk, agent, new_si = agent.sample_actions(gr00t_obs)
+            if _deploy_socket is not None:
+                # Use deploy's exact inference pipeline via ZMQ.
+                # Build observation in the format deploy_cr5af_gripper expects.
+                deploy_obs = {
+                    "video": {
+                        view: np.stack([
+                            np.asarray(gr00t_obs[f"video.{view}"])] * 2, axis=0
+                        )[None, ...]  # (1, 2, H, W, C)
+                        for view in actor._video_keys
+                    },
+                    "state": {
+                        k: np.asarray(gr00t_obs[f"state.{k}"]).reshape(-1)[None, None, :]
+                        for k in actor._state_keys
+                    },
+                    "language": {"annotation.human.task_description": [[task_description]]},
+                }
+                import msgpack, msgpack_numpy
+                msgpack_numpy.patch()
+                _deploy_socket.send(msgpack.packb({"observation": deploy_obs}))
+                raw = _deploy_socket.recv()
+                response = msgpack.unpackb(raw)
+                action_dict = {
+                    k: np.array(v, dtype=np.float32).squeeze(0) for k, v in response.items()
+                }
+                # eef_9d from deploy is (T,9) in mm; graft into action format
+                abs_eef = action_dict.get("eef_9d", np.zeros((10, 9), dtype=np.float32))
+                abs_j = action_dict.get("joint_pos", np.zeros((10, 6), dtype=np.float32))
+                abs_g = action_dict.get("gripper_pos", np.zeros((10, 1), dtype=np.float32))
+                action_chunk = np.concatenate([abs_eef, abs_j, abs_g], axis=-1)  # (T, 16), mm
+                new_si = {}
+            else:
+                action_chunk, agent, new_si = agent.sample_actions(gr00t_obs)
             episode_log.sample_info_history.append(new_si)
             training_log.record_sample_time(time.time() - sample_start, step_metrics)
             action_plan.extend(action_chunk[:FLAGS.replan_steps])

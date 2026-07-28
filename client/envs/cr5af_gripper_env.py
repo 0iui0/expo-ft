@@ -55,9 +55,10 @@ EEF9D_SLICE = slice(0, 9)
 JOINT_SLICE = slice(9, 15)
 GRIPPER_IDX = 15
 
-# ── Workspace bounds (matching deploy_cr5af_gripper.py SafetyChecker defaults).
-WORKSPACE_MIN_XYZ = np.array([200.0, -400.0, 0.0], dtype=np.float64)    # mm
-WORKSPACE_MAX_XYZ = np.array([800.0, 200.0, 600.0], dtype=np.float64)   # mm
+# ── Workspace bounds — EXACTLY matching deploy_cr5af_gripper.py:
+# --workspace-min 369 -245 110 --workspace-max 820 299 442
+WORKSPACE_MIN_XYZ = np.array([369.0, -245.0, 110.0], dtype=np.float64)   # mm
+WORKSPACE_MAX_XYZ = np.array([820.0, 299.0, 442.0], dtype=np.float64)    # mm
 MAX_TRANSLATION_DELTA = 10.0   # mm per step (deploy default)
 MAX_ROTATION_DELTA = 5.0       # deg per step (deploy default)
 MAX_CONSECUTIVE_VIOLATIONS = 10
@@ -258,9 +259,17 @@ class CR5AFGripperEnv:
         self._video_dir = video_dir
         self._preview = bool(preview)
 
-        # Safety checker (ported from deploy_cr5af_gripper.py): clip per-step
-        # deltas, keep targets inside the calibrated workspace.
-        self._safety = SafetyChecker()
+        # Safety checker — use config's calibrate bounds if provided, otherwise
+        # the deploy defaults (matching deploy_cr5af_gripper.py).
+        bounds = kwargs.get("bounds", None)
+        if bounds is not None and len(bounds) == 2:
+            ws_min = np.array(bounds[0], dtype=np.float64)
+            ws_max = np.array(bounds[1], dtype=np.float64)
+        else:
+            ws_min, ws_max = WORKSPACE_MIN_XYZ, WORKSPACE_MAX_XYZ
+        self._safety = SafetyChecker(
+            workspace_min_xyz=ws_min,
+            workspace_max_xyz=ws_max)
 
         # Camera frame cache (owned by the preview thread when preview is on,
         # so get_observation never races a concurrent RealSense read).
@@ -359,11 +368,8 @@ class CR5AFGripperEnv:
             return
 
         tv = list(struct.unpack_from("<6d", data, RT_TOOL_VECTOR))
-        # NOTE: xyz in MILLIMETERS, joint angles in DEGREES, and tv[3:6] is the
-        # ROTVEC (axis-angle) orientation in degrees — all matching
-        # deploy_cr5af_gripper.py and the SFT training data. Converting to SI
-        # (m / rad) or treating tv[3:6] as euler XYZ would descale the policy's
-        # state input and corrupt the rotation.
+        # eef_9d xyz is kept in MILLIMETRES (raw tool vector, matching deploy and
+        # record_demo). The GR00T SFT normalisation stats were computed on mm data.
         xyz_mm = np.array(tv[:3])
         tcp_rxyz_deg = np.array(tv[3:6])
         rot = R.from_rotvec(tcp_rxyz_deg, degrees=True)
@@ -570,20 +576,18 @@ class CR5AFGripperEnv:
     def step(self, action: np.ndarray) -> Dict[str, Any]:
         """Non-blocking: cache the latest action target and return immediately.
 
-        A separate control-loop thread runs at ``control_hz``, reading the cached
-        target + current robot state, computing deltas, enforcing safety, and
-        sending ServoP commands at a fixed rate.  This decouples the RL training
-        step cadence (which includes variable-duration GPU inference) from the
-        robot command rate.
+        The policy action eef_9d xyz arrives in METRES (matching the SFT
+        normalisation stats). The control thread converts to mm internally for
+        ServoP (which takes absolute mm).
         """
-        action = np.asarray(action, dtype=np.float64).ravel()
-        assert action.shape == (16,), f"action must be (16,), got {action.shape}"
-        with self._cmd_lock:  # reuse for latest-action cache (held briefly)
+        action_m = np.asarray(action, dtype=np.float64).ravel()
+        assert action_m.shape == (16,), f"action must be (16,), got {action_m.shape}"
+        with self._cmd_lock:
             if self._latest_action is None:
-                self._latest_action = action.copy()
+                self._latest_action = action_m.copy()
             else:
-                self._latest_action[:] = action
-        return {"executed_action": action.astype(np.float64)}
+                self._latest_action[:] = action_m
+        return {"executed_action": action_m.astype(np.float64)}
 
     def _control_loop(self):
         """Fixed-rate (control_hz) loop: read cached target + current state,
@@ -639,8 +643,8 @@ class CR5AFGripperEnv:
                         pos_delta = np.array([tx * hil_scale, ty * hil_scale, -tz * hil_scale])
                     else:
                         pos_delta = np.zeros(3, dtype=np.float64)
-                    target_xyz = cur_eef[:3] + pos_delta
-                    target_xyz = np.clip(target_xyz, WORKSPACE_MIN_XYZ, WORKSPACE_MAX_XYZ)
+                    target_xyz = cur_eef[:3] + pos_delta   # both mm
+                    target_xyz = np.clip(target_xyz, self._safety.workspace_min, self._safety.workspace_max)
                     if self._safety.check_workspace(target_xyz):
                         if float(np.linalg.norm(pos_delta)) > 0.0:
                             self._servop(target_xyz[0], target_xyz[1], target_xyz[2],
@@ -684,6 +688,7 @@ class CR5AFGripperEnv:
                     action = np.where(np.isfinite(action), action, 0.0)
 
                 # ── motion computation ─────────────────────────────────
+                # Everything in mm — matches deploy / record_demo / SFT stats.
                 targ_eef = action[EEF9D_SLICE].copy()
                 cur_xyz_mm = cur_eef[:3]
 
@@ -783,7 +788,7 @@ class CR5AFGripperEnv:
             if hand is None or table is None:
                 return
             with self._lock:
-                cur_xyz = self._eef_9d[:3].copy()
+                cur_xyz = self._eef_9d[:3].copy()  # already mm
                 grip = self._gripper_pos
             # Convert RGB (RealSense rgb8) → BGR for cv2.imshow
             hand = cv2.cvtColor(hand, cv2.COLOR_RGB2BGR)

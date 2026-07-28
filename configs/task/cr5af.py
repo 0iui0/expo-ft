@@ -43,8 +43,9 @@ def get_config():
     config.action_space = "cartesian_velocity"
     config.gripper_action_space = "velocity"
 
-    # Workspace bounds and reset joints (override per task).
-    config.bounds = None
+    # Workspace bounds — calibrated for THIS desk (matching deploy_cr5af_gripper.py
+    # --workspace-min 369 -245 110 --workspace-max 820 299 442).
+    config.bounds = [[369, -245, 110], [820, 299, 442]]
     config.reset_joints = None
 
     config.reset_random = False
@@ -55,7 +56,9 @@ def get_config():
     config.side_camera_id = "table_view"
     config.wrist_camera_id = "hand_view"
 
-    # Image size (matches GR00T processor defaults)
+    # Image size — preserved at 256×256. The GR00T processor resizes internally;
+    # a different aspect ratio here changes pixel values in non-obvious ways and
+    # was observed to break the policy's directional output.
     config.image_size = (256, 256)
     config.control_hz = 8
     config.preview = True   # show labelled camera preview (D455|D405) in run_client

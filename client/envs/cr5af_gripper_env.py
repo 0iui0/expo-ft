@@ -256,6 +256,7 @@ class CR5AFGripperEnv:
         self.done = False
         self.success = False
         self.reward = 0.0
+        self._episode_status: Optional[str] = None  # "success", "reset", or None (from cv2 preview)
         self._video_dir = video_dir
         self._preview = bool(preview)
 
@@ -563,6 +564,7 @@ class CR5AFGripperEnv:
         self.done = False
         self.success = False
         self.reward = 0.0
+        self._episode_status = None  # clear cv2 preview status
 
         # Open gripper
         try:
@@ -772,12 +774,17 @@ class CR5AFGripperEnv:
     def _render_preview(self):
         """Render the labelled preview (D455 | D405) from the cached native frames.
 
-        MUST be called on the main thread (asyncio loop, i.e. from step()) so
-        cv2.imshow / waitKey are safe with the Qt backend.
+        MUST be called on the main thread (asyncio loop) so cv2.imshow / waitKey
+        are safe with the Qt backend.
 
         The cached frames are native-resolution RGB (640×480). We convert to BGR
         (cv2's expected format), downscale to 320×240 to match record_demo's
         preview, then upscale 2× so the window is readable.
+
+        Keyboard shortcuts (when preview window is focused):
+          s — mark episode SUCCESS (done=True, success=True)
+          f — mark episode FAILURE / reset (done=True, success=False)
+          c — clear status / keep going (done=False)
         """
         import cv2
         try:
@@ -789,7 +796,9 @@ class CR5AFGripperEnv:
                 return
             with self._lock:
                 cur_xyz = self._eef_9d[:3].copy()  # already mm
-                grip = self._gripper_pos
+            # Read real gripper position when gripper is available
+            grip = (self._gripper.get_position() if self._gripper is not None
+                    else self._gripper_pos)
             # Convert RGB (RealSense rgb8) → BGR for cv2.imshow
             hand = cv2.cvtColor(hand, cv2.COLOR_RGB2BGR)
             table = cv2.cvtColor(table, cv2.COLOR_RGB2BGR)
@@ -798,30 +807,59 @@ class CR5AFGripperEnv:
                 cv2.resize(table, (tw * 2, th * 2)),
                 cv2.resize(hand, (tw * 2, th * 2)),
             ])
+            # ── status label ──────────────────────────────────────────────
+            status_str = ""
+            status_color = (0, 255, 0)  # green = normal
+            if self._episode_status == "success":
+                status_str = "  [SUCCESS]"
+                status_color = (0, 255, 0)  # green
+            elif self._episode_status == "reset":
+                status_str = "  [FAILURE]"
+                status_color = (0, 0, 255)  # red
+            grip_str = "CLOSE" if grip < 0.5 else "OPEN"
             label = (f"D455(table) | D405(hand)"
                      f"  xyz=[{cur_xyz[0]:.0f} {cur_xyz[1]:.0f} {cur_xyz[2]:.0f}]mm"
                      f"  d=[{delta[0]:+.1f} {delta[1]:+.1f} {delta[2]:+.1f}]mm"
-                     f"  grip={'CLOSE' if grip < 0.5 else 'OPEN'}")
+                     f"  grip={grip_str}"
+                     f"{status_str}"
+                     f"  [s]=success [f]=fail")
             cv2.putText(preview, label, (12, 30),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 0), 2)
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.65, status_color, 2)
             cv2.imshow("CR5AF env (D455 | D405)", preview)
-            cv2.waitKey(1)
+            key = cv2.waitKey(1) & 0xFF
+            if key == ord('s'):
+                self._episode_status = "success"
+                logger.info("Preview key: SUCCESS (s)")
+            elif key == ord('f'):
+                self._episode_status = "reset"
+                logger.info("Preview key: FAILURE / reset (f)")
+            elif key == ord('c'):
+                self._episode_status = None
+                logger.info("Preview key: clear / keep going (c)")
         except Exception as e:
             logger.warning("preview error: %s", e)
 
     def get_info_for_step(self) -> Tuple[bool, bool, float, float]:
-        # Manual success via keyboard (from client.real_utils.detector)
-        try:
-            from client.real_utils.detector import success_detector_manual
-            manual = success_detector_manual()
-            if manual == "success":
-                self.done, self.success = True, True
-            elif manual == "reset":
-                self.done, self.success = True, False
-            else:
+        # Primary: cv2 preview keyboard (s=success, f=fail).  This is the main
+        # path because the preview window is always focused during operation.
+        # Fallback: stdin-based success_detector_manual (1/2/3) for headless runs.
+        status = self._episode_status  # set by _render_preview on main thread
+        if status == "success":
+            self.done, self.success = True, True
+        elif status == "reset":
+            self.done, self.success = True, False
+        else:
+            try:
+                from client.real_utils.detector import success_detector_manual
+                manual = success_detector_manual()
+                if manual == "success":
+                    self.done, self.success = True, True
+                elif manual == "reset":
+                    self.done, self.success = True, False
+                else:
+                    self.done, self.success = False, False
+            except Exception:
                 self.done, self.success = False, False
-        except Exception:
-            self.done, self.success = False, False
 
         reward = 1.0 if self.success else 0.0
         mask = 0.0 if self.done else 1.0

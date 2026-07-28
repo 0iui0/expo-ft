@@ -53,7 +53,10 @@ def clear_batch(batch: Dict[str, Any]) -> None:
 
 def get_batch_info(batch: Dict[str, Any]) -> Dict[str, float]:
     """Extract basic statistics from a batch dictionary for logging."""
-    return {
+    # Use the first image key present in the batch (GR00T uses hand_view/table_view;
+    # Pi0.5 uses base_0_rgb).
+    image_keys = list(batch.get("image", {}).keys())
+    info = {
         "rewards_mean": float(np.mean(batch["rewards"])),
         "rewards_std": float(np.std(batch["rewards"])),
         "rewards_max": float(np.max(batch["rewards"])),
@@ -70,10 +73,13 @@ def get_batch_info(batch: Dict[str, Any]) -> Dict[str, float]:
         "states_std": float(np.std(batch["state"])),
         "states_max": float(np.max(batch["state"])),
         "states_min": float(np.min(batch["state"])),
-        "base_image_max": float(np.max(batch["image"]["base_0_rgb"])),
-        "base_image_min": float(np.min(batch["image"]["base_0_rgb"])),
-        "base_image_std": float(np.std(batch["image"]["base_0_rgb"])),
     }
+    if image_keys:
+        first_img = batch["image"][image_keys[0]]
+        info["image_max"] = float(np.max(first_img))
+        info["image_min"] = float(np.min(first_img))
+        info["image_std"] = float(np.std(first_img))
+    return info
 
 
 def build_pi05_config(config):

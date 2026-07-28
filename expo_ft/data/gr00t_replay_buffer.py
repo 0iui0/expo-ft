@@ -96,6 +96,7 @@ def create_gr00t_replay_buffer(config, example_action, capacity, task_descriptio
 
     # Resolve actual dimensions from the checkpoint's processor
     from pathlib import Path
+    import gr00t.model  # noqa: F401 — register GR00T processor/model with HF registry
     from transformers import AutoProcessor
 
     processor = AutoProcessor.from_pretrained(
@@ -115,8 +116,8 @@ def create_gr00t_replay_buffer(config, example_action, capacity, task_descriptio
     modality_cfg = processor.get_modality_configs()[embodiment]
     env_action_horizon = len(modality_cfg["action"].delta_indices)
 
-    # Image shape from one example
-    image_h, image_w = example_action.get("image_size", (256, 256))
+    # Image shape from config (example_action is a flat ndarray, not a dict)
+    image_h, image_w = getattr(config, "image_size", (256, 256))
     video_horizon = len(modality_cfg["video"].delta_indices)  # e.g. 2
 
     buf = Gr00tReplayBuffer(
@@ -366,30 +367,34 @@ class Gr00tReplayBuffer(Dataset):
 
         # Map OpenPI camera keys to GR00T view keys.
         # Convention: wrist_image_left → first view, exterior_image_1_left → second view.
-        _img_keys = [k for k in obs if isinstance(obs[k], np.ndarray) and obs[k].ndim >= 2]
+        # Camera images may be at obs["image"][key] (Droid HDF5) or obs[key] (flat).
+        _img_source = obs.get("image", obs)
+        _img_keys = [k for k in _img_source if isinstance(_img_source[k], np.ndarray) and _img_source[k].ndim >= 2]
         _openpi_cam_map = {
             "wrist_image_left": 0,
             "exterior_image_1_left": 1,
         }
         images: dict = {}
         for openpi_key, idx in _openpi_cam_map.items():
-            if openpi_key in obs and idx < len(self._camera_keys):
-                images[self._camera_keys[idx]] = np.asarray(obs[openpi_key])
+            if openpi_key in _img_source and idx < len(self._camera_keys):
+                images[self._camera_keys[idx]] = np.asarray(_img_source[openpi_key])
 
         # If no explicit match, assign available image keys heuristically
         _unmatched = [k for k in _img_keys if k not in _openpi_cam_map]
         _assigned = len(images)
         for k in _unmatched:
             if _assigned < len(self._camera_keys):
-                images[self._camera_keys[_assigned]] = np.asarray(obs[k])
+                images[self._camera_keys[_assigned]] = np.asarray(_img_source[k])
                 _assigned += 1
 
-        # Map state: concatenate known OpenPI state keys in canonical order
-        _openpi_state_order = ["cartesian_position", "joint_position", "gripper_position"]
+        # Map state: may be nested under obs["state"] (Droid HDF5) or flat obs keys
+        _state_source = obs.get("state", obs)
+        _openpi_state_order = ["cartesian_position", "cartesian_velocity",
+                                "joint_position", "gripper_position", "gripper_velocity"]
         state_parts = []
         for k in _openpi_state_order:
-            if k in obs:
-                state_parts.append(np.asarray(obs[k], dtype=np.float32).reshape(-1))
+            if k in _state_source:
+                state_parts.append(np.asarray(_state_source[k], dtype=np.float32).reshape(-1))
         if not state_parts:
             state_parts = [np.zeros(self._env_state_dim, dtype=np.float32)]
         flat_state = np.concatenate(state_parts)
@@ -401,6 +406,14 @@ class Gr00tReplayBuffer(Dataset):
 
         data_dict["image"] = images
         data_dict["state"] = flat_state.astype(np.float32)
+
+        # Resize images to match GR00T processor expected size (stored in buffer)
+        import cv2
+        _img_sz = getattr(self, "_image_size", (256, 256))
+        for v in data_dict["image"]:
+            img = data_dict["image"][v]
+            if img.shape[0] != _img_sz[0] or img.shape[1] != _img_sz[1]:
+                data_dict["image"][v] = cv2.resize(img, (_img_sz[1], _img_sz[0]))
         return data_dict
 
     # -- sampling ------------------------------------------------------------

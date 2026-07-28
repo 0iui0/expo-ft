@@ -49,7 +49,7 @@ def get_config():
     config.gr00t_model_path = ""
 
     # Embodiment tag registered by the modality config (e.g. "NEW_EMBODIMENT")
-    config.gr00t_embodiment_tag = "NEW_EMBODIMENT"
+    config.gr00t_embodiment_tag = "new_embodiment"
 
     # If True, freeze GR00T backbone (faster training, lower VRAM)
     config.freeze_gr00t_backbone = False

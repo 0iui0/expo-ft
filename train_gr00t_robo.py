@@ -142,13 +142,25 @@ def main(_):
     else:
         raise ValueError(f"Unsupported dataset type: {FLAGS.config_task.env_type}")
 
-    # --- Create environment ---
+    # --- Build GR00T actor FIRST (model load is slow; env connect is deferred) ---
+    from expo_ft.agents.vla.gr00t_agent import build_gr00t
+    from expo_ft.agents.alg.expo_ft_gr00t import EXPOLearnerGR00T, load_agent, restore_checkpoint, save_checkpoint
+
+    task_description = getattr(FLAGS.config_task, "language_instruction",
+                                "grasp motor shaft and insert into bushing")
+    actor, actor_train_state, target_actor_params, agent_kwargs, vla_metadata = build_gr00t(
+        FLAGS.config, FLAGS.seed, mesh, data_sharding, replicated_sharding,
+        resuming, task_description,
+    )
+
+    # --- Create environment (connects to env server — retry loop until up) ---
     train_env_creation_request = {
         "example_action": example_action,
         "env_usage": "train",
         "video_dir": train_video_dir,
     }
-    logging.info("Creating environment...")
+    logging.info("Creating environment (will wait for env server at %s:%d)...",
+                 FLAGS.client_host, FLAGS.client_port)
     env = EnvClientWrapper(
         env_creation_request=train_env_creation_request,
         host=FLAGS.client_host,
@@ -156,15 +168,6 @@ def main(_):
     )
     env.reset()
     logging.info("Created training environment %s", env.env_id)
-
-    # --- Build GR00T actor ---
-    from expo_ft.agents.vla.gr00t_agent import build_gr00t
-    from expo_ft.agents.alg.expo_ft_gr00t import EXPOLearnerGR00T, load_agent, restore_checkpoint, save_checkpoint
-
-    actor, actor_train_state, target_actor_params, agent_kwargs, vla_metadata = build_gr00t(
-        FLAGS.config, FLAGS.seed, mesh, data_sharding, replicated_sharding,
-        resuming, env.task_description,
-    )
 
     # --- Create replay buffers ---
     rb_args = dict(

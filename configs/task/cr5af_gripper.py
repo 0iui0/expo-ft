@@ -29,6 +29,7 @@ def get_config():
     config.robot_ip = "192.168.5.1"
     config.speed = 50.0  # motion speed percentage (0-100)
     config.translation_only = False
+    config.control_hz = 8  # RL control loop rate → env step() dt = 1/control_hz
 
     # ── cameras ──────────────────────────────────────────────────────────
     config.camera_serial_hand = "260322277798"   # D405 wrist camera

@@ -51,31 +51,92 @@ class Args:
 
     server_host: str = "0.0.0.0"
     server_port: int = 8102
-    config_task_path: str = "configs/task/pick.py"
+    config_task_path: str = "configs/task/cr5af.py"
 
 
 _env_storage: Dict[str, Any] = {}
 _config_task_path: Optional[str] = None
 _task_config: Optional[Any] = None
 
-# Human-in-the-loop: lazy spacemouse for droid envs
+# Preview tasks, keyed by env_id, so the cv2 renderer can be cleanly cancelled
+# when an env is replaced (stale-cleanup). Runs in the asyncio main thread.
+_preview_tasks: dict = {}
+
+
+async def _preview_loop(env: Any, env_id: str):
+    """Render the cv2 preview at ~15 Hz in the asyncio main thread (cv2-safe).
+
+    Runs independently of the step() control path so imshow/waitKey latency
+    never jitters the robot motion timing.
+    """
+    del env_id  # unused; kept for future task-cancellation key
+    while getattr(env, "_running", False):
+        try:
+            env._render_preview()
+        except Exception:
+            pass
+        await asyncio.sleep(1.0 / 15)
+
+
+# Human-in-the-loop: SpaceMouse teleop matching record_demo_gripper.py.
+# Reference logic (HidrawSpaceMouse):
+#   - Right button (buttons[1]) = deadman: hold to move
+#   - Left button (buttons[0])  = gripper toggle (edge-triggered)
+#   - dead_zone = 0.15 on normalised axes (raw / 350 → [-1, 1])
+#   - tdelta = [tx*scale, ty*scale, -tz*scale]   (mm per step)
+#   - rdelta = [-roll*rot_scale, pitch*rot_scale, -yaw*rot_scale]  (deg per step)
 _spacemouse_policy: Optional[Any] = None
-_HUMAN_OVERRIDE_NORM_THRESHOLD = 1e-4
+_hil_gripper_state: float = 1.0   # 0.0=closed, 1.0=open (toggled by left button)
+_hil_prev_left_btn: bool = False
+_HIL_DEAD_ZONE = 0.15
 
 
 def _get_human_override_action(task_config: Optional[Any] = None) -> tuple:
-    """Return (action_7d or None, is_human). Assumes 7D action space."""
-    global _spacemouse_policy
+    """Return (action_7d or None, is_human).
+
+    action_7d = [tx, ty, tz, rx, ry, rz, grip] where tx..tz are normalised
+    [-1, 1] from HidrawSpaceMouse (easyhid) and grip is 0.0 or 1.0.
+
+    Matches record_demo_gripper.py exactly: right-button deadman, dead_zone
+    threshold, left-button gripper toggle. The device already normalises and
+    orders axes as [tx,ty,tz,roll,pitch,yaw] — no extra /350 needed.
+    """
+    global _spacemouse_policy, _hil_gripper_state, _hil_prev_left_btn
     try:
         if _spacemouse_policy is None:
-            from client.real_utils.spacemouse import SpaceMousePolicy
-            _spacemouse_policy = SpaceMousePolicy(
-                max_lin_vel=task_config.collect_max_lin_vel,
-                max_rot_vel=task_config.collect_max_rot_vel,
-            )
-        action_7d, _ = _spacemouse_policy.forward(None, include_info=True)
-        is_active = np.linalg.norm(action_7d[:6]) > _HUMAN_OVERRIDE_NORM_THRESHOLD
-        return (action_7d, True) if is_active else (None, False)
+            from client.real_utils.spacemouse import HidrawSpaceMouse
+            _spacemouse_policy = HidrawSpaceMouse()
+
+        action_6d, buttons = _spacemouse_policy.get_action()
+        # action_6d = [tx, ty, tz, roll, pitch, yaw] already normalised [-1, 1]
+
+        # Right button (buttons[1]) = deadman: only while held does the human own
+        # the arm. On release, control returns to the policy.
+        deadman = len(buttons) > 1 and bool(buttons[1])
+        if not deadman:
+            return (None, False)
+
+        # Left button (buttons[0]) = gripper toggle (edge-triggered) — processed
+        # whenever the deadman is held, BEFORE the dead-zone check so it works
+        # even while the SpaceMouse is momentarily still.
+        left_btn = len(buttons) > 0 and bool(buttons[0])
+        if left_btn and not _hil_prev_left_btn:
+            _hil_gripper_state = 0.0 if _hil_gripper_state > 0.5 else 1.0
+        _hil_prev_left_btn = left_btn
+
+        # Deadman held → human owns the arm this step, even if the SpaceMouse is
+        # momentarily still. Return a hold (zero-delta) action with is_human=True
+        # so the policy NEVER resumes mid-takeover (that caused jitter / partial
+        # takeover as policy and human alternated control).
+        dead_zone = float(getattr(task_config, "hil_dead_zone", _HIL_DEAD_ZONE)) if task_config is not None else _HIL_DEAD_ZONE
+        if float(np.max(np.abs(action_6d[:6]))) < dead_zone:
+            tx = ty = tz = 0.0  # hold position
+        else:
+            tx, ty, tz = float(action_6d[0]), float(action_6d[1]), float(action_6d[2])
+
+        # Rotation held in HIL; pass [tx, ty, tz, 0,0,0, grip]
+        action_7d = np.array([tx, ty, tz, 0.0, 0.0, 0.0, _hil_gripper_state], dtype=np.float64)
+        return (action_7d, True)
     except Exception as e:
         logging.getLogger(__name__).warning("Spacemouse unavailable (%s), using policy action.", e)
         return None, False
@@ -99,13 +160,30 @@ async def _handle_environment_request(websocket: _server.ServerConnection):
                     env_name = task_config.env_name
                     env_usage = request["env_usage"]
                     env_id = f"{env_name}_{env_usage}"
-                    
+
+                    # Clean up stale env from previous client (release robot sockets)
+                    if env_id in _env_storage:
+                        logger.info(f"Closing stale environment {env_id}...")
+                        if env_id in _preview_tasks:
+                            _preview_tasks.pop(env_id).cancel()
+                        try:
+                            _env_storage[env_id].close()
+                        except Exception:
+                            pass
+                        del _env_storage[env_id]
+
                     logger.info(f"Creating environment {env_id}...")
                     env_kwargs = dict(task_config)
                     env_kwargs["video_dir"] = request.get("video_dir") or ""
                     env = task_config.env(**env_kwargs)
                     _env_storage[env_id] = env
                     logger.info(f"Environment {env_id} created successfully")
+                    # Start a low-rate preview task if the config enables it.
+                    # Runs in the asyncio main thread (cv2-safe) so it cannot
+                    # jitter the step() control path.
+                    if getattr(task_config, "preview", False):
+                        _preview_tasks[env_id] = asyncio.create_task(
+                            _preview_loop(env, env_id))
                     
                     task_description = task_config.language_instruction
                     response = {"status": "success", "env_id": env_id, "task_description": task_description}
@@ -148,16 +226,44 @@ async def _handle_environment_request(websocket: _server.ServerConnection):
                         if _task_config is not None and _task_config.env_type == "droid":
                             sm_action, is_human = _get_human_override_action(_task_config)
                             if is_human and sm_action is not None:
-                                real_action[:6] = sm_action[:6]
-                                real_action[6] = sm_action[6]
+                                # Reference-style delta (matches record_demo_gripper.py):
+                                #   tdelta = [tx*scale, ty*scale, -tz*scale]
+                                #   target = cur_xyz + tdelta
+                                # action_6d values are normalised [-1, 1]; grip is 0/1.
+                                obs = env.get_observation()
+                                cur_xyz = obs["state.eef_9d"][:3]       # mm
+                                cur_rot6d = obs["state.eef_9d"][3:9]
+                                cur_joints = obs["state.joint_pos"]
+                                # Per-step scale (mm/unit/step). record_demo uses
+                                # 8mm/step @ 30Hz; at 8Hz control we scale up so the
+                                # takeover feels similar. Tunable via config.
+                                action_scale = float(getattr(_task_config, "hil_action_scale", 20.0))
+                                tx, ty, tz = sm_action[0], sm_action[1], sm_action[2]
+                                tdelta = np.array([
+                                    tx * action_scale,
+                                    ty * action_scale,
+                                    -tz * action_scale,   # match reference: -tz
+                                ])
+                                new_xyz = cur_xyz + tdelta
+                                # Rotation: hold current
+                                new_eef_9d = np.concatenate([new_xyz, cur_rot6d]).astype(np.float64)
+                                # Gripper: action_7d[6] is already 0.0/1.0 from toggle
+                                new_grip = float(sm_action[6])
+                                real_action = np.concatenate([
+                                    new_eef_9d, cur_joints, [new_grip]
+                                ]).astype(np.float64)
                                 action_type = "human"
                         sent_is_invalid = np.allclose(sent_action, -1.0)
+                        if is_human:
+                            env._hil_mode = True  # skip EMA + dead-zone for direct feel
                         if is_human or not sent_is_invalid:
                             step_result = env.step(real_action)
                             executed_action = np.array(
                                 step_result["executed_action"],
                                 dtype=np.float64,
                             )
+                        if is_human:
+                            env._hil_mode = False
                         else:
                             executed_action = real_action
 

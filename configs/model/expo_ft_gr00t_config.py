@@ -51,8 +51,11 @@ def get_config():
     # Embodiment tag registered by the modality config (e.g. "NEW_EMBODIMENT")
     config.gr00t_embodiment_tag = "new_embodiment"
 
-    # If True, freeze GR00T backbone (faster training, lower VRAM)
-    config.freeze_gr00t_backbone = False
+    # If True, freeze the VLM backbone (vision encoder + LLM) and train only
+    # the DiT action head. Matches the EXPO-FT recipe (base image encoder
+    # frozen, paper §C.1) and is REQUIRED to fit Adam optimizer states on a
+    # single 32 GiB GPU (full model ~3B params → ~12 GiB Adam state → OOM).
+    config.freeze_gr00t_backbone = True
 
     config.freeze_critic_encoder = False
 

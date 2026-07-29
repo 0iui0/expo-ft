@@ -6,6 +6,7 @@ serve as the VLA actor in EXPOLearnerGR00T.
 """
 from __future__ import annotations
 
+import logging
 import time
 from types import SimpleNamespace
 from typing import TYPE_CHECKING, Any, Dict, Optional, Tuple, Union
@@ -17,6 +18,8 @@ from transformers import AutoModel, AutoProcessor
 
 from expo_ft.agents.vla.vla_base import Model
 from expo_ft.agents.vla.gr00t_train_state import PyTorchTrainState
+
+logger = logging.getLogger(__name__)
 
 if TYPE_CHECKING:
     # gr00t is imported lazily at runtime (initialize / prepare_batch_for_actor)
@@ -111,6 +114,7 @@ class Gr00tAgent(Model):
         lr: float = 1e-5,
         weight_decay: float = 1e-5,
         ema_decay: float = 0.999,
+        freeze_backbone: bool = False,
         **kwargs,
     ) -> Tuple[Gr00tAgent, PyTorchTrainState, dict]:
         """Load GR00T model + processor and create a Gr00tAgent.
@@ -148,12 +152,31 @@ class Gr00tAgent(Model):
         model.to(device=device, dtype=dtype)
         model.train()
 
+        # Optionally freeze the VLM backbone (vision encoder + LLM) and train
+        # only the DiT action head. This matches the EXPO-FT recipe (base image
+        # encoder frozen, §C.1) and is REQUIRED to fit Adam optimizer states
+        # on a single 32 GiB GPU: the full model (~3B params) needs ~12 GiB of
+        # Adam state, which OOMs together with the model + critic + activations.
+        if freeze_backbone:
+            backbone = getattr(model, "backbone", None)
+            if backbone is not None:
+                for p in backbone.parameters():
+                    p.requires_grad_(False)
+                n_train = sum(p.numel() for p in model.parameters() if p.requires_grad)
+                n_total = sum(p.numel() for p in model.parameters())
+                logger.info(
+                    "freeze_gr00t_backbone=True: backbone frozen, "
+                    "training %d / %d params (%.1f%%)",
+                    n_train, n_total, 100.0 * n_train / max(n_total, 1),
+                )
+
         # Load processor
         processor = AutoProcessor.from_pretrained(processor_dir)
         processor.train()
 
-        # Create optimizer
-        opt = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=weight_decay)
+        # Create optimizer over trainable params only
+        trainable_params = [p for p in model.parameters() if p.requires_grad]
+        opt = torch.optim.AdamW(trainable_params, lr=lr, weight_decay=weight_decay)
 
         # Create opaque PyTorchTrainState
         train_state = PyTorchTrainState.create(model, opt, ema_decay=ema_decay)
@@ -783,6 +806,9 @@ def build_gr00t(config, seed, mesh, data_sharding, replicated_sharding, resume, 
         # default); 0.999 ~= tau_pi=1e-3 and enables a target forward via
         # ``PyTorchTrainState.run_with_ema``.
         ema_decay=config.get("gr00t_actor_ema_decay", None),
+        # Freeze the VLM backbone, train only the DiT action head (paper §C.1,
+        # and required to fit Adam states in 32 GiB).
+        freeze_backbone=config.get("freeze_gr00t_backbone", False),
     )
 
     # Base-VLA target EMA is unused on the GR00T EXPO path (OTF/next-action

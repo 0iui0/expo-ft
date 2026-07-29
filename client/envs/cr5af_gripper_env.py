@@ -840,26 +840,18 @@ class CR5AFGripperEnv:
             logger.warning("preview error: %s", e)
 
     def get_info_for_step(self) -> Tuple[bool, bool, float, float]:
-        # Primary: cv2 preview keyboard (s=success, f=fail).  This is the main
-        # path because the preview window is always focused during operation.
-        # Fallback: stdin-based success_detector_manual (1/2/3) for headless runs.
+        # Episode status is set ONLY by the cv2 preview keyboard (s=success,
+        # f=fail) in _render_preview. Do NOT add a stdin/tty fallback here:
+        # success_detector_manual uses a blocking readline that hijacks terminal
+        # keystrokes and blocks this method (called every training step over
+        # websocket), which stalls the handler and looks like a thor hang.
         status = self._episode_status  # set by _render_preview on main thread
         if status == "success":
             self.done, self.success = True, True
         elif status == "reset":
             self.done, self.success = True, False
         else:
-            try:
-                from client.real_utils.detector import success_detector_manual
-                manual = success_detector_manual()
-                if manual == "success":
-                    self.done, self.success = True, True
-                elif manual == "reset":
-                    self.done, self.success = True, False
-                else:
-                    self.done, self.success = False, False
-            except Exception:
-                self.done, self.success = False, False
+            self.done, self.success = False, False
 
         reward = 1.0 if self.success else 0.0
         mask = 0.0 if self.done else 1.0

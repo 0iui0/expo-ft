@@ -95,7 +95,7 @@ def get_config():
     # --- Latency / VRAM tuning ---
     # Gradient checkpointing: recomputes activations during backward to reduce
     # peak VRAM ~25-30% at the cost of ~15% more wall time per training step.
-    config.use_gradient_checkpointing = False
+    config.use_gradient_checkpointing = True
 
     # --- Async safety ---
     # Model access lock: when using async learner/actor mode, serializes

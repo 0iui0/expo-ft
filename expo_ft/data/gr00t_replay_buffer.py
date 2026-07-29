@@ -220,60 +220,67 @@ class Gr00tReplayBuffer(Dataset):
 
     # -- snapshot persistence (survives training crashes) -----------------------
 
-    def save_snapshot(self, path: str) -> None:
-        """Save valid buffer data to a compressed .npz file.
+    def save_snapshot(self, path: str, *, online_start: int = 0) -> None:
+        """Save the *online* buffer segment to a fast uncompressed .npz file.
 
-        Only the *valid* window is saved (from oldest to newest), not the full
-        pre-allocated capacity.  The caller is responsible for calling this
-        frequently enough that the valid window is manageable (e.g. per-episode
-        so ≤ a few thousand transitions).
+        Only transitions from ``online_start`` onward are saved (the offline
+        dataset, which is reloaded from disk on restart, is excluded).  No
+        compression — images in a .npz compress poorly and deflate takes 30+
+        seconds for thousands of frames; uncompressed writes finish in << 1 s.
         """
         import logging
         _log = logging.getLogger(__name__)
-        if self._size == 0:
-            _log.info("buffer snapshot: empty, skipped save")
+        if self._size <= online_start:
+            _log.info("buffer snapshot: %d online transitions, skipped save",
+                      self._size - online_start)
             return
 
         # Linearise the circular buffer [oldest, ..., newest)
         if self._size < self._capacity:
-            # Buffer hasn't wrapped — data is at [0, _size)
-            valid = {k: v[:self._size] for k, v in self.dataset_dict.items()}
+            indices = np.arange(online_start, self._size)
         else:
-            # Buffer wrapped — data spans [_insert_index, capacity) + [0, _insert_index)
-            head = self._capacity - self._insert_index
-            valid = {}
-            for k, v in self.dataset_dict.items():
-                valid[k] = np.concatenate([
-                    v[self._insert_index:],
-                    v[:self._insert_index],
-                ])
+            start = self._insert_index
+            all_indices = list(range(start, self._capacity)) + list(range(0, start))
+            tail = min(online_start, len(all_indices))
+            indices = np.array(all_indices[tail:])
 
+        valid = {k: v[indices] for k, v in self.dataset_dict.items()}
         meta = {
-            "_size": self._size,
-            "_insert_index": self._insert_index,
+            "_size": len(indices),
+            "_insert_index": 0,  # linearised → starts at 0
+            "_online_start": online_start,
         }
-        np.savez_compressed(path, **meta, **valid)
+        np.savez(path, **meta, **valid)
         _log.info(
-            "buffer snapshot saved: %d transitions → %s",
-            self._size, path,
+            "buffer snapshot saved: %d online transitions → %s (%.1f MB)",
+            len(indices), path, __import__('os').path.getsize(path) / 1e6,
         )
 
     @classmethod
-    def load_snapshot(cls, path: str, **buffer_kwargs) -> "Gr00tReplayBuffer":
-        """Load a saved snapshot and reconstruct the buffer."""
+    def load_snapshot(cls, path: str, *, online_start: int = 0,
+                      **buffer_kwargs) -> "Gr00tReplayBuffer":
+        """Load a saved snapshot and reconstruct only the online portion.
+
+        offline_start marks where offline data begins; the restored buffer
+        is sized to hold capacity transitions with the online data appended.
+        """
         import logging
         _log = logging.getLogger(__name__)
         data = np.load(path)
         saved_size = int(data["_size"])
-        buf = cls(capacity=max(saved_size, buffer_kwargs.get("capacity", 5000)),
+        required_cap = online_start + saved_size
+        cap = max(required_cap, buffer_kwargs.get("capacity", 5000))
+        buf = cls(capacity=cap,
                   **{k: v for k, v in buffer_kwargs.items() if k != "capacity"})
+        # Place online data after the (already-reserved) offline segment
+        off = online_start
         for k in buf.dataset_dict:
-            buf.dataset_dict[k][:saved_size] = data[k][:saved_size]
-        buf._size = saved_size
-        buf._insert_index = saved_size % buf._capacity
+            buf.dataset_dict[k][off:off + saved_size] = data[k][:saved_size]
+        buf._size = off + saved_size
+        buf._insert_index = (off + saved_size) % buf._capacity
         _log.info(
-            "buffer snapshot loaded: %d transitions from %s",
-            buf._size, path,
+            "buffer snapshot loaded: %d online transitions + %d offline offset"
+            " from %s", saved_size, online_start, path,
         )
         return buf
 

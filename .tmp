@@ -1,0 +1,23 @@
+● Good — openpi/ is gitignored (line 11), so the vendored sharding.py patch stays on disk but won't be tracked (I'll document that). Branch convention is fix(bN)/feat(bN-bN). 9
+  modified + 2 untracked, +485/−176. Now reading the actual diffs to verify content + scan for secrets/paths before committing.
+
+● Bash(git -C /home/zpa/workspace/3rd/expo-ft diff -- configs expo_ft scripts train_gr00t_robo.py)
+  ⎿  diff --git a/configs/model/expo_ft_gr00t_config.py b/configs/model/expo_ft_gr00t_config.py
+     index 53d9fe4..35558c8 100644
+     --- a/configs/model/expo_ft_gr00t_config.py
+     … +566 lines (ctrl+o to expand)
+
+● Bash(git -C /home/zpa/workspace/3rd/expo-ft diff -- docs/GR00T_EXPO_RL_PIPELINE.md scripts/train_gr00t_cr5af.sh)
+  ⎿  diff --git a/docs/GR00T_EXPO_RL_PIPELINE.md b/docs/GR00T_EXPO_RL_PIPELINE.md
+     index e779558..20bd4f3 100644
+     --- a/docs/GR00T_EXPO_RL_PIPELINE.md
+     … +370 lines (ctrl+o to expand)
+
+● API Error: Request rejected (429) · [1310][您已达到每周/每月使用上限，您的限额将在 2026-07-03 18:58:04 重置。][202607011014136ba0c443bf794822]
+
+✻ Cooked for 2m 21s
+
+  3 tasks (0 done, 1 in progress, 2 open)
+  ◼ Commit the GR00T integration fixes (part a)
+  ◻ Promote smoke_learner.py into tests/ (part b)
+  ◻ Discuss env server + reward classifier integration (part c)

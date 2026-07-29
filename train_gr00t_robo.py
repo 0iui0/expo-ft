@@ -193,6 +193,9 @@ def main(_):
         actor_success_only=actor_success_only,
         dataset=dataset,
     )
+    # Snapshot save/restore: the buffer already holds the offline dataset;
+    # everything inserted after this point is online (HIL + policy) data.
+    _online_snapshot_start = int(replay_buffer._insert_index)
 
     # --- Create EXPOLearnerGR00T ---
     # Build example observation/action/state for agent init
@@ -408,7 +411,8 @@ def main(_):
                 snapshot_dir = os.path.join(checkpoint_dir, "buffers")
                 os.makedirs(snapshot_dir, exist_ok=True)
                 replay_buffer.save_snapshot(
-                    os.path.join(snapshot_dir, "online_snapshot.npz")
+                    os.path.join(snapshot_dir, "online_snapshot.npz"),
+                    online_start=_online_snapshot_start,
                 )
             except Exception as e:
                 logging.warning("Buffer snapshot save failed: %s", e)

@@ -121,6 +121,10 @@ def main(_):
     os.makedirs(train_video_dir, exist_ok=True)
     checkpoint_dir = os.path.join(log_dir, "checkpoints")
     os.makedirs(checkpoint_dir, exist_ok=True)
+    # Buffer snapshots live OUTSIDE the checkpoint directory so --overwrite
+    # (which wipes checkpoint_dir) doesn't destroy saved HIL data.
+    _buffer_snapshot_dir = os.path.join(log_dir, "buffer_snapshots")
+    os.makedirs(_buffer_snapshot_dir, exist_ok=True)
 
     checkpoint_dir_path = epath.Path(checkpoint_dir)
     checkpoint_manager, resuming = initialize_checkpoint_dir(
@@ -199,7 +203,7 @@ def main(_):
 
     # Restore online data from a previous session's snapshot (if it exists).
     # This means HIL data survives training crashes — no more lost episodes.
-    _snapshot_path = os.path.join(checkpoint_dir, "buffers", "online_snapshot.npz")
+    _snapshot_path = os.path.join(_buffer_snapshot_dir, "online_snapshot.npz")
     if os.path.exists(_snapshot_path):
         n = replay_buffer.restore_online_from(_snapshot_path)
         if n > 0:
@@ -411,10 +415,8 @@ def main(_):
             # Persist online buffer snapshot so HIL data survives crashes.
             # Saved every episode; size ~ few hundred transitions → fast.
             try:
-                snapshot_dir = os.path.join(checkpoint_dir, "buffers")
-                os.makedirs(snapshot_dir, exist_ok=True)
                 replay_buffer.save_snapshot(
-                    os.path.join(snapshot_dir, "online_snapshot.npz"),
+                    os.path.join(_buffer_snapshot_dir, "online_snapshot.npz"),
                     online_start=_online_snapshot_start,
                 )
             except Exception as e:

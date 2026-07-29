@@ -218,6 +218,65 @@ class Gr00tReplayBuffer(Dataset):
         self._size = 0
         self._insert_index = 0
 
+    # -- snapshot persistence (survives training crashes) -----------------------
+
+    def save_snapshot(self, path: str) -> None:
+        """Save valid buffer data to a compressed .npz file.
+
+        Only the *valid* window is saved (from oldest to newest), not the full
+        pre-allocated capacity.  The caller is responsible for calling this
+        frequently enough that the valid window is manageable (e.g. per-episode
+        so ≤ a few thousand transitions).
+        """
+        import logging
+        _log = logging.getLogger(__name__)
+        if self._size == 0:
+            _log.info("buffer snapshot: empty, skipped save")
+            return
+
+        # Linearise the circular buffer [oldest, ..., newest)
+        if self._size < self._capacity:
+            # Buffer hasn't wrapped — data is at [0, _size)
+            valid = {k: v[:self._size] for k, v in self.dataset_dict.items()}
+        else:
+            # Buffer wrapped — data spans [_insert_index, capacity) + [0, _insert_index)
+            head = self._capacity - self._insert_index
+            valid = {}
+            for k, v in self.dataset_dict.items():
+                valid[k] = np.concatenate([
+                    v[self._insert_index:],
+                    v[:self._insert_index],
+                ])
+
+        meta = {
+            "_size": self._size,
+            "_insert_index": self._insert_index,
+        }
+        np.savez_compressed(path, **meta, **valid)
+        _log.info(
+            "buffer snapshot saved: %d transitions → %s",
+            self._size, path,
+        )
+
+    @classmethod
+    def load_snapshot(cls, path: str, **buffer_kwargs) -> "Gr00tReplayBuffer":
+        """Load a saved snapshot and reconstruct the buffer."""
+        import logging
+        _log = logging.getLogger(__name__)
+        data = np.load(path)
+        saved_size = int(data["_size"])
+        buf = cls(capacity=max(saved_size, buffer_kwargs.get("capacity", 5000)),
+                  **{k: v for k, v in buffer_kwargs.items() if k != "capacity"})
+        for k in buf.dataset_dict:
+            buf.dataset_dict[k][:saved_size] = data[k][:saved_size]
+        buf._size = saved_size
+        buf._insert_index = saved_size % buf._capacity
+        _log.info(
+            "buffer snapshot loaded: %d transitions from %s",
+            buf._size, path,
+        )
+        return buf
+
     def count_episodes_chronological(self) -> int:
         if self._size == 0:
             return 0

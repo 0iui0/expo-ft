@@ -218,6 +218,43 @@ class Gr00tReplayBuffer(Dataset):
         self._size = 0
         self._insert_index = 0
 
+    def restore_online_from(self, snapshot_path: str) -> int:
+        """Load online data from a snapshot into this buffer (in-place).
+
+        The offline dataset must already be present (inserted).  The snapshot's
+        online transitions are appended after the current insert position.
+        Returns the number of transitions loaded.
+        """
+        import logging
+        _log = logging.getLogger(__name__)
+        try:
+            data = np.load(snapshot_path)
+        except Exception as e:
+            _log.warning("Could not load buffer snapshot %s: %s", snapshot_path, e)
+            return 0
+        saved_size = int(data["_size"])
+        if saved_size == 0:
+            return 0
+        start = self._insert_index
+        end = start + saved_size
+        if end > self._capacity:
+            _log.warning(
+                "Snapshot %s has %d transitions but buffer capacity %d is too "
+                "small (need %d). Truncating.",
+                snapshot_path, saved_size, self._capacity, end,
+            )
+            saved_size = self._capacity - start
+            end = start + saved_size
+        for k in self.dataset_dict:
+            self.dataset_dict[k][start:end] = data[k][:saved_size]
+        self._size = end
+        self._insert_index = end % self._capacity
+        _log.info(
+            "buffer snapshot restored: %d online transitions from %s",
+            saved_size, snapshot_path,
+        )
+        return saved_size
+
     # -- snapshot persistence (survives training crashes) -----------------------
 
     def save_snapshot(self, path: str, *, online_start: int = 0) -> None:

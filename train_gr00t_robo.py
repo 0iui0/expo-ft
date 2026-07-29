@@ -197,6 +197,16 @@ def main(_):
     # everything inserted after this point is online (HIL + policy) data.
     _online_snapshot_start = int(replay_buffer._insert_index)
 
+    # Restore online data from a previous session's snapshot (if it exists).
+    # This means HIL data survives training crashes — no more lost episodes.
+    _snapshot_path = os.path.join(checkpoint_dir, "buffers", "online_snapshot.npz")
+    if os.path.exists(_snapshot_path):
+        n = replay_buffer.restore_online_from(_snapshot_path)
+        if n > 0:
+            logging.info("Restored %d online transitions from snapshot.", n)
+            # Recalculate online_start after restore
+            _online_snapshot_start = int(replay_buffer._insert_index)
+
     # --- Create EXPOLearnerGR00T ---
     # Build example observation/action/state for agent init
     # Use format compatible with GR00T replay buffer layout
@@ -385,13 +395,6 @@ def main(_):
             batch_processor.insert_transition(transition_dict)
 
         can_update = training_log.ep_count >= 10 and i >= FLAGS.batch_size
-        if can_update:
-            # Before the first (and subsequent) gradient updates, force-release
-            # any cached memory so the Adam optimizer state allocation has room.
-            import gc
-            import torch as _torch
-            gc.collect()
-            _torch.cuda.empty_cache()
         if FLAGS.update_type == "step" and can_update:
             run_agent_updates(FLAGS.num_updates, step_metrics)
 

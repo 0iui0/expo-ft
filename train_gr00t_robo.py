@@ -386,6 +386,12 @@ def main(_):
             run_agent_updates(FLAGS.num_updates, step_metrics)
 
         if done:
+            logging.info(
+                "Episode done at step %d: success=%s, ep_count=%d, "
+                "online_episodes=%d, update_threshold=%d",
+                i, success, training_log.ep_count + 1,
+                replay_buffer.count_episodes_chronological(), 10,
+            )
             batch_processor.on_episode_done(success)
             env.reset()
 

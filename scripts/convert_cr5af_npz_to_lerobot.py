@@ -112,6 +112,9 @@ def _load_episode(episode_dir: Path):
     hz = float(meta.get("hz", 30.0))
 
     cartesian = _state_to_cartesian(state).astype(np.float32)
+    # RealSense default is BGR8; convert to RGB for PaliGemma.
+    imgs_table = imgs_table[..., ::-1]
+    imgs_hand = imgs_hand[..., ::-1]
     return cartesian, grip, imgs_table, imgs_hand, task, int(round(hz))
 
 

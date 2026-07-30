@@ -66,8 +66,8 @@ class CR5AFGripperDroidEnv:
     # ── observation: CR5AF (GR00T-format) -> DROID keys ──────────────────────
     def get_observation(self) -> Dict[str, Any]:
         obs = self._env.get_observation()
-        table = np.asarray(obs["video.table_view"], dtype=np.uint8)
-        hand = np.asarray(obs["video.hand_view"], dtype=np.uint8)
+        table = np.asarray(obs["video.table_view"], dtype=np.uint8)[..., ::-1]  # BGR->RGB
+        hand = np.asarray(obs["video.hand_view"], dtype=np.uint8)[..., ::-1]    # BGR->RGB
         cartesian = _eef9d_to_cartesian(obs["state.eef_9d"])
         gripper = np.asarray(obs["state.gripper_pos"], dtype=np.float32).reshape(-1)
         return {

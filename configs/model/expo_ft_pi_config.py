@@ -36,10 +36,10 @@ def get_config():
     config.freeze_pi05_encoder = True
     config.freeze_critic_encoder = False  # if True, encoder is frozen for Q (only extract embeddings)
     
-    config.pi05_weight_loader_path = "" # pi05 sft checkpoint path
+    config.pi05_weight_loader_path = "/cache/openpi/pi05_base/params"  # pi05_base checkpoint (local)
     # assets_dir is the base path; norm stats are loaded from assets_dir/asset_id.
-    config.pi05_assets_dir = ""
-    config.pi05_asset_id = ""
+    config.pi05_assets_dir = "/home/zpa/workspace/3rd/expo-ft/.claude/worktrees/pi05/assets"
+    config.pi05_asset_id = "expo_pi05_droid_lora_finetune_sft_cartesian_state/cr5af/shaft_insert"
     config.actor_success_only = True
     config.use_full_augmentation = True  # False = only crop (no rotate/color jitter)
 

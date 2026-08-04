@@ -27,20 +27,27 @@ from client.envs.cr5af_gripper_env import CR5AFGripperEnv
 
 
 def _eef9d_to_cartesian(eef_9d: np.ndarray) -> np.ndarray:
-    """9D eef [xyz_mm(3), rot6d(6)] -> 9D cartesian [xyz_m(3), rot6d(6)]."""
-    eef = np.asarray(eef_9d, dtype=np.float64).flatten()
-    xyz_m = eef[:3] * 0.001
-    return np.concatenate([xyz_m, eef[3:9]]).astype(np.float32)
+    """9D eef [xyz_m(3), rot6d(6)] -> 9D DROID cartesian (identity).
+
+    ``CR5AFGripperEnv`` already emits eef xyz in meters (its RT feed applies
+    ``MM_TO_M``), matching the DROID / SFT convention, so this is a passthrough.
+    """
+    return np.asarray(eef_9d, dtype=np.float32).flatten()[:9]
 
 
 def _cartesian10d_to_eef16(action_10d: np.ndarray) -> np.ndarray:
-    """10D action [xyz_m(3), rot6d(6), gripper] -> 16D target [xyz_mm, rot6d, joint0, gripper]."""
+    """10D action [xyz_m(3), rot6d(6), gripper] -> 16D target
+    [eef_9d(xyz_m, rot6d), joint(6)=0, gripper].
+
+    xyz stays in meters: the wrapped env's ``step`` subtracts the current eef
+    (also meters) before scaling the delta to a ServoP velocity in mm/s.
+    """
     a = np.asarray(action_10d, dtype=np.float64).flatten()
-    xyz_mm = a[:3] * 1000.0
+    xyz = a[:3]
     rot6d = a[3:9]
     joints = np.zeros(6, dtype=np.float64)  # unused by ServoP cartesian controller
     grip = np.array([a[9]], dtype=np.float64)
-    return np.concatenate([xyz_mm, rot6d, joints, grip]).astype(np.float64)
+    return np.concatenate([xyz, rot6d, joints, grip]).astype(np.float64)
 
 
 class CR5AFGripperDroidEnv:

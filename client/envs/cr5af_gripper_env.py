@@ -55,6 +55,14 @@ EEF9D_SLICE = slice(0, 9)
 JOINT_SLICE = slice(9, 15)
 GRIPPER_IDX = 15
 
+# CR5AF joint soft limits (deg), read off the controller pendant: only J3 is
+# narrow (±160°); all others are ±360°. reset() checks the parked joints against
+# these — a joint parked past its limit makes the controller refuse EVERY servo
+# command (ServoJ/ServoP alike) with ErrorID -5, so we fail fast instead of
+# streaming rejected commands. +2° matches the pendant's limit tolerance band.
+JOINT_LIMITS_DEG = np.array([360.0, 360.0, 160.0, 360.0, 360.0, 360.0])
+JOINT_LIMIT_TOL_DEG = 2.0
+
 
 def _rot6d_to_matrix(rot6d: np.ndarray) -> np.ndarray:
     """rot6d (two 3-vectors) → 3x3 rotation matrix (Gram-Schmidt)."""
@@ -93,6 +101,9 @@ class CR5AFGripperEnv:
         camera_serial_table: str = "",
         speed: float = 50.0,
         translation_only: bool = False,
+        joint_space: bool = False,
+        max_joint_vel: float = 120.0,
+        max_rot_vel: float = 8.0,
         control_hz: float = 30.0,
         language_instruction: str = "grasp motor shaft and insert into bushing",
         video_dir: str = "",
@@ -104,13 +115,23 @@ class CR5AFGripperEnv:
         self._image_size = image_size
         self._speed_pct = speed
         self._translation_only = translation_only
+        # Joint-space control (InverseKin + ServoJ) avoids the wrist-singularity
+        # (joint5≈90°) Cartesian planner throttle that freezes ServoP. max_joint_vel
+        # (deg/s) is the per-joint safety cap applied to each ServoJ delta.
+        self._joint_space = joint_space
+        self._max_joint_vel = max_joint_vel
+        # ServoP orientation rate cap (deg/s). Near this pose the Cartesian->joint
+        # map amplifies angular rate onto joint6 ~15x, so 15 deg/s tripped the
+        # joint6 planning-speed alarm (code 53, ~233 deg/s vs 234 limit). Keep this
+        # low so joint6 stays under the limit.
+        self._max_rot_vel = max_rot_vel
         self._language_instruction = language_instruction
-        self._servo_gain = 250  # lower = softer (default 250, range 200-1000)
         self._dt = 1.0 / control_hz  # step period for ServoP velocity scaling
 
         # ── thread-safe state cache (SI units) ─────────────────────────────
         self._lock = threading.Lock()
         self._pos = np.zeros(7, dtype=np.float64)  # xyz + quat
+        self._tcp_rxyz_deg = np.zeros(3, dtype=np.float64)  # native tool axis-angle (deg)
         self._q = np.zeros(6, dtype=np.float64)     # joint angles (rad)
         self._eef_9d = np.zeros(9, dtype=np.float32)  # current eef_9d
         self._joint_pos = np.zeros(6, dtype=np.float32)
@@ -236,14 +257,18 @@ class CR5AFGripperEnv:
 
         tv = list(struct.unpack_from("<6d", data, RT_TOOL_VECTOR))
         xyz = np.array(tv[:3]) * MM_TO_M
-        rxyz_rad = np.array(tv[3:6]) * DEG2RAD
-        rot = R.from_euler("XYZ", rxyz_rad)
+        # Dobot tool_vector[3:6] is an axis-angle (rotation vector) in degrees.
+        # This MUST match the training recorder (record_demo_gripper.rxyz_to_rot6d
+        # uses R.from_rotvec); interpreting it as Euler XYZ injects a ~71 deg
+        # orientation error and drives the policy out of distribution.
+        rot = R.from_rotvec(np.array(tv[3:6]), degrees=True)
         quat = rot.as_quat()  # xyzw
 
         q = np.array(list(struct.unpack_from("<6d", data, RT_Q_ACTUAL))) * DEG2RAD
 
         with self._lock:
             self._pos = np.concatenate([xyz, quat])
+            self._tcp_rxyz_deg = np.array(tv[3:6], dtype=np.float64)
             self._q = q.copy()
             self._eef_9d = np.concatenate([xyz, _matrix_to_rot6d(rot.as_matrix())]).astype(np.float32)
             self._joint_pos = self._q.astype(np.float32)
@@ -277,15 +302,28 @@ class CR5AFGripperEnv:
             try:
                 self._drain_cmd()
                 self._cmd_sock.sendall(cmd.encode("utf-8"))
-                if read_response:
-                    self._cmd_sock.settimeout(timeout)
+                if not read_response:
+                    return ""
+                # Dobot echoes the command in every reply ("ErrorID,{...},Name(...)").
+                # This socket also carries fire-and-forget commands (ServoP/ServoJ/
+                # RunScript) whose un-read replies can arrive mid-read; skip any
+                # reply whose echoed name != the command just sent so requests and
+                # responses stay paired (else e.g. a stray RunScript reply is read
+                # as the InverseKin result -> empty {} -> spurious "IK failed").
+                name = cmd.split("(", 1)[0]
+                self._cmd_sock.settimeout(timeout)
+                deadline = time.time() + timeout
+                while time.time() < deadline:
                     resp = bytearray()
                     while True:
                         c = self._cmd_sock.recv(1)
                         if not c or c == b";":
                             break
                         resp.extend(c)
-                    return resp.decode("utf-8").strip()
+                    text = resp.decode("utf-8").strip()
+                    if not text or (name + "(") in text:
+                        return text
+                    # stale reply from an earlier command — skip and keep reading
                 return ""
             except Exception as e:
                 logger.warning("cmd error: %s", e)
@@ -304,9 +342,13 @@ class CR5AFGripperEnv:
             logger.error("cmd reconnect failed: %s", e)
 
     def _enable_robot(self):
-        for cmd in ("EnableRobot()", f"SpeedFactor({int(self._speed_pct)})",
+        # ClearError + ResetRobot first: a prior servo-limit alarm (e.g. code 53)
+        # latches the controller, after which InverseKin/ServoJ return errors
+        # until cleared. Mirrors the proven record_demo_gripper bring-up.
+        for cmd in ("ClearError()", "ResetRobot()", "EnableRobot()",
+                     f"SpeedFactor({int(self._speed_pct)})",
                      f"AccL({int(self._speed_pct)})"):
-            self._send_cmd(cmd, read_response=False)
+            self._send_cmd(cmd, read_response=True, timeout=3.0)
             time.sleep(0.3)
 
     # ═══════════════════════════════════════════════════════════════════════
@@ -314,10 +356,16 @@ class CR5AFGripperEnv:
     # ═══════════════════════════════════════════════════════════════════════
 
     def _servop(self, x_mm, y_mm, z_mm, rx_deg, ry_deg, rz_deg):
-        """Fire-and-forget ServoP (cartesian velocity, non-blocking)."""
-        g = self._servo_gain
+        """Fire-and-forget ServoP to an ABSOLUTE pose (mm, deg). No optional
+        params (``gain=`` earns ErrorID -5 on this firmware) and — critically —
+        NO reply read: the proven recorder streams ServoP continuously without
+        reading replies. A blocking per-command reply read stalls the stream, so
+        the controller drops servo mode and cold-solves each target's IK to the
+        canonical branch (joint6 wraps ~360° off the current ~-198°), crossing a
+        joint soft limit -> ErrorID -5 on every command. Streaming at a tight
+        cadence keeps servo engaged and seeded at the current joints."""
         cmd = (f"ServoP({x_mm:.3f},{y_mm:.3f},{z_mm:.3f},"
-               f"{rx_deg:.3f},{ry_deg:.3f},{rz_deg:.3f},gain={g})")
+               f"{rx_deg:.3f},{ry_deg:.3f},{rz_deg:.3f})")
         with self._cmd_lock:
             try:
                 self._drain_cmd()
@@ -328,6 +376,91 @@ class CR5AFGripperEnv:
     def _runscript(self, project: str):
         """Trigger a DobotStudio project via RunScript."""
         self._send_cmd(f'RunScript("{project}")', read_response=False)
+
+    # ── joint-space control (InverseKin + ServoJ) ───────────────────────────
+
+    @staticmethod
+    def _parse_kin(resp: str) -> Optional[np.ndarray]:
+        """Parse a Dobot ``ErrorID,{v1,...,v6},FuncName(...)`` reply into a
+        6-vector (deg). Returns None on a non-zero ErrorID or malformed reply."""
+        if not resp:
+            return None
+        try:
+            if resp.split(",", 1)[0].strip() != "0":
+                return None
+            lb, rb = resp.find("{"), resp.find("}")
+            if lb < 0 or rb < 0:
+                return None
+            vals = [float(v) for v in resp[lb + 1:rb].split(",")]
+            return np.array(vals, dtype=np.float64) if len(vals) == 6 else None
+        except Exception:
+            return None
+
+    def _inverse_kin(self, x_mm, y_mm, z_mm, rx_deg, ry_deg, rz_deg,
+                     jnear_deg: np.ndarray) -> Optional[np.ndarray]:
+        """Cartesian pose (mm, deg axis-angle) -> joint solution (deg), biased to
+        ``jnear_deg`` (current config) so the branch never flips. Blocking
+        round-trip on the command socket. Returns None if the controller fails."""
+        jn = "{" + ",".join(f"{v:.4f}" for v in jnear_deg) + "}"
+        cmd = (f"InverseKin({x_mm:.3f},{y_mm:.3f},{z_mm:.3f},"
+               f"{rx_deg:.4f},{ry_deg:.4f},{rz_deg:.4f},"
+               f"useJointNear=1,jointNear={jn})")
+        resp = self._send_cmd(cmd, read_response=True, timeout=1.0)
+        j = self._parse_kin(resp)
+        if j is None:
+            logger.warning("InverseKin bad reply: %r", resp)
+        return j
+
+    def _servoj(self, j_deg: np.ndarray):
+        """ServoJ joint-space servo (deg). Reads the reply so the socket stays
+        synchronous with the per-step InverseKin and any throttle/limit ErrorID
+        (e.g. 53) surfaces in the log instead of silently freezing the arm."""
+        cmd = "ServoJ(" + ",".join(f"{v:.3f}" for v in j_deg) + ")"
+        resp = self._send_cmd(cmd, read_response=True, timeout=1.0)
+        if resp and resp.split(",", 1)[0].strip() != "0":
+            logger.warning("servoj rejected: %s", resp)
+
+    def _servo_joint(self, target_xyz_mm, target_rot_deg, cur_q_deg, dt):
+        """Realize a Cartesian target in joint space: InverseKin (biased to the
+        current config) -> per-joint unwrap + rate clamp -> ServoJ. Sidesteps the
+        Cartesian wrist singularity that throttles ServoP. Holds if IK fails."""
+        j_targ = self._inverse_kin(target_xyz_mm[0], target_xyz_mm[1], target_xyz_mm[2],
+                                   target_rot_deg[0], target_rot_deg[1], target_rot_deg[2],
+                                   cur_q_deg)
+        if j_targ is None:
+            logger.warning("InverseKin failed; holding joints")
+            return
+        # Unwrap each joint delta into [-180, 180] (kills the joint6 ±180 flip),
+        # then cap by the per-joint velocity limit.
+        dj = (j_targ - cur_q_deg + 180.0) % 360.0 - 180.0
+        max_dj = self._max_joint_vel * dt
+        dj = np.clip(dj, -max_dj, max_dj)
+        self._servoj(cur_q_deg + dj)
+
+    def probe_ik_latency(self, n: int = 20) -> Tuple[float, float, int]:
+        """Time ``n`` InverseKin round-trips at the current pose (no motion).
+        Decides whether blocking IK fits the control period before any run."""
+        with self._lock:
+            pos = self._pos.copy()
+            q_deg = np.degrees(self._q.copy())
+        xyz_mm = pos[:3] * M_TO_MM
+        rot_deg = R.from_quat(pos[3:]).as_rotvec(degrees=True)
+        dts, ok = [], 0
+        for _ in range(n):
+            t0 = time.time()
+            j = self._inverse_kin(xyz_mm[0], xyz_mm[1], xyz_mm[2],
+                                  rot_deg[0], rot_deg[1], rot_deg[2], q_deg)
+            dts.append((time.time() - t0) * 1000.0)
+            if j is not None:
+                ok += 1
+        arr = np.asarray(dts)
+        logger.info("InverseKin latency over %d calls: mean=%.1fms max=%.1fms ok=%d/%d "
+                    "(control period=%.1fms)", n, arr.mean(), arr.max(), ok, n, self._dt * 1000.0)
+        return float(arr.mean()), float(arr.max()), ok
+
+    def stop(self):
+        """Stop motion and exit servo mode (StopRobot)."""
+        self._send_cmd("StopRobot()", read_response=False)
 
     def _robot_mode_check(self) -> int:
         """Return RobotMode (7=RUNNING)."""
@@ -399,6 +532,21 @@ class CR5AFGripperEnv:
         self.success = False
         self.reward = 0.0
 
+        # Joint-limit self-check: if the arm is parked past a soft limit, every
+        # servo command is refused with -5 (and ClearError can't clear the alarm
+        # while the joint stays out of range). Fail fast, naming the joint(s), so
+        # the operator jogs it back instead of watching a run silently freeze.
+        with self._lock:
+            q_deg = np.degrees(self._q.copy())
+        over = np.abs(q_deg) > (JOINT_LIMITS_DEG + JOINT_LIMIT_TOL_DEG)
+        if over.any():
+            bad = ", ".join(f"J{i + 1}={q_deg[i]:.1f}°(limit ±{JOINT_LIMITS_DEG[i]:.0f}°)"
+                            for i in np.where(over)[0])
+            raise RuntimeError(
+                f"joint(s) parked past soft limit: {bad}. Jog them back within "
+                f"range on the pendant before deploying — servo commands would "
+                f"be refused with ErrorID -5.")
+
         # Open gripper
         try:
             self._gripper_open()
@@ -414,36 +562,61 @@ class CR5AFGripperEnv:
 
         with self._lock:
             cur_eef = self._eef_9d.astype(np.float64).copy()
+            cur_pos = self._pos.copy()  # [xyz_m(3), quat(4)]
+            cur_tcp_rxyz = self._tcp_rxyz_deg.copy()  # native tool triple (deg)
+            cur_q_deg = np.degrees(self._q.copy())  # current joints (deg)
             cur_grip = self._gripper_pos
 
-        # eef delta: target - current
+        # ServoP takes an ABSOLUTE Cartesian target pose (mm, deg), NOT a
+        # velocity. (Confirmed on hardware: feeding velocities makes the robot
+        # IK-solve the raw numbers as a pose -> "预处理逆解算无解".) Mirror the
+        # proven cr5af_server teleop: target = current pose + clamped delta.
         targ_eef = action[EEF9D_SLICE]
-        eef_delta = targ_eef - cur_eef
-
-        # position delta (xyz) in mm
-        pos_delta_mm = eef_delta[:3] * M_TO_MM
-
-        # rotation delta: R_targ @ R_cur^T → axis-angle velocity
-        R_cur = _rot6d_to_matrix(cur_eef[3:9])
-        R_targ = _rot6d_to_matrix(targ_eef[3:9])
-        R_delta = R_targ @ R_cur.T
-        rxyz_delta_deg = R.from_matrix(R_delta).as_euler("XYZ", degrees=True)
-
-        # scale to velocity
         dt = self._dt  # step period in seconds (1/control_hz)
-        vel_mm = pos_delta_mm / dt
-        vel_deg = rxyz_delta_deg / dt
 
-        # Clamp velocities
-        max_vel_mm = 50.0  # m/s equivalent safety cap
-        vel_mm = np.clip(vel_mm, -max_vel_mm, max_vel_mm)
-        vel_deg = np.clip(vel_deg, -30.0, 30.0)
+        # ── translation: clamp per-step delta (50 mm/s cap at the control period)
+        cur_xyz_mm = cur_pos[:3] * M_TO_MM
+        targ_xyz_mm = targ_eef[:3] * M_TO_MM
+        pos_delta_mm = np.clip(targ_xyz_mm - cur_xyz_mm, -50.0 * dt, 50.0 * dt)
+        target_xyz_mm = cur_xyz_mm + pos_delta_mm
 
+        # ── orientation target (deg, native tool axis-angle) ─────────────────
         if self._translation_only:
-            vel_deg = np.zeros(3)
+            # Feed the controller's OWN measured tool triple straight back (mirror
+            # the recorder). Re-deriving it via as_rotvec(from_quat(...)) flips the
+            # axis-angle sign near |rot|=180° (the arm sits at rx≈-179°), so the
+            # "held" orientation jumps step-to-step and — amplified by the wrist
+            # singularity (J5≈90°) — spikes joint6 planning speed past its limit.
+            # The raw triple is byte-constant while orientation is held -> no spike.
+            target_rot_deg = cur_tcp_rxyz
+        elif self._joint_space:
+            # Absolute policy orientation target. In joint-space mode the
+            # per-joint ServoJ clamp below is the hard rate limit near the wrist
+            # singularity, so no Cartesian rate cap here (it can't tame joint6).
+            target_rot_deg = R.from_matrix(_rot6d_to_matrix(targ_eef[3:9])).as_rotvec(degrees=True)
+        else:
+            # ServoP path: compose the delta in SO(3) and rate-cap it by its
+            # rotation-vector magnitude (a true angular-speed cap preserving the
+            # axis — per-component euler clipping would distort it). NOTE: this
+            # cannot tame joint6 at the wrist singularity — use joint_space there.
+            R_cur = _rot6d_to_matrix(cur_eef[3:9])
+            R_targ = _rot6d_to_matrix(targ_eef[3:9])
+            delta_rotvec_deg = R.from_matrix(R_targ @ R_cur.T).as_rotvec(degrees=True)
+            ang = float(np.linalg.norm(delta_rotvec_deg))
+            max_ang = self._max_rot_vel * dt
+            if ang > max_ang:
+                delta_rotvec_deg = delta_rotvec_deg * (max_ang / ang)
+            R_delta = R.from_rotvec(delta_rotvec_deg, degrees=True).as_matrix()
+            # ServoP orientation is the native tool_vector axis-angle (degrees);
+            # invert the from_rotvec state-encode with as_rotvec.
+            target_rot_deg = R.from_matrix(R_delta @ R_cur).as_rotvec(degrees=True)
 
-        self._servop(vel_mm[0], vel_mm[1], vel_mm[2],
-                     vel_deg[0], vel_deg[1], vel_deg[2])
+        # ── dispatch: joint-space (IK + ServoJ) or Cartesian (ServoP) ────────
+        if self._joint_space:
+            self._servo_joint(target_xyz_mm, target_rot_deg, cur_q_deg, dt)
+        else:
+            self._servop(target_xyz_mm[0], target_xyz_mm[1], target_xyz_mm[2],
+                         target_rot_deg[0], target_rot_deg[1], target_rot_deg[2])
 
         # gripper
         grip_target = float(action[GRIPPER_IDX])

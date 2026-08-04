@@ -191,7 +191,9 @@ class BCLearner(AgentLearner, struct.PyTreeNode):
             train=False,
             num_samples=1,
         )
-        raw_actions = self.actor.process_transformed_outputs(transformed_actions)
+        raw_actions = self.actor.process_transformed_outputs(
+            transformed_actions, state=transformed_inputs["state"]
+        )
         action = raw_actions[0]
         sample_info = {"sample_time": sample_time, "selected_action_type": "main"}
         return jnp.array(action), self.replace(rng=rng), sample_info

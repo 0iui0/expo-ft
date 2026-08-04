@@ -565,8 +565,10 @@ class EXPOLearner(AgentLearner, struct.PyTreeNode):
             train=False,
             num_samples=self.N,
         )
-        raw_actions = self.actor.process_transformed_outputs(transformed_actions)
-        
+        raw_actions = self.actor.process_transformed_outputs(
+            transformed_actions, state=transformed_inputs["state"]
+        )
+
         if only_base_actions:
             action = raw_actions[0].reshape(self.action_horizon, self.action_dim)
             sample_info = {"sample_time": sample_time, "selected_action_type": "main"}
@@ -606,7 +608,9 @@ class EXPOLearner(AgentLearner, struct.PyTreeNode):
 
                 r_modified = r_samples.reshape(self.n_edit_samples, self.replan_steps, self.action_dim)
                 full_r_modified = transformed_full[:self.n_edit_samples].at[:, :self.replan_steps, :].set(r_modified)
-                raw_r_samples = self.actor.process_transformed_outputs(full_r_modified)
+                raw_r_samples = self.actor.process_transformed_outputs(
+                    full_r_modified, state=transformed_inputs["state"]
+                )
                 raw_actions = jnp.concatenate([raw_actions, raw_r_samples], axis=0)
 
             qs = compute_q(self.target_critic.apply_fn, target_params, critic_encoded_obs, transformed_actions, transformed_states, self.num_min_qs)

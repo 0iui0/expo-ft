@@ -403,13 +403,31 @@ class Pi05Agent(Model):
         processed_inputs = _model.Observation.from_dict(transformed_inputs).to_dict()
         return processed_inputs
 
-    def process_transformed_outputs(self, transformed_actions, unnormalize=True):
-        """Unnormalize unpadded actions back to the environment action space."""
+    def process_transformed_outputs(self, transformed_actions, unnormalize=True, state=None):
+        """Unnormalize unpadded actions back to the environment action space.
+
+        state: optional NORMALIZED, padded reference state the model consumed
+            (``transformed_inputs["state"]``, shape ``(1, action_dim)`` or
+            ``(n, action_dim)``). Required when the data config uses delta
+            actions (``AbsoluteActions`` in ``data_transforms.outputs``): the
+            output pipeline's ``Unnormalize`` -> ``AbsoluteActions`` reconstructs
+            absolute xyz = delta + raw current state, mirroring ``Policy.infer``
+            (policy.py:104). When None, falls back to zeros — correct only for
+            absolute-action configs; under delta actions the xyz would be added
+            to the quantile midpoint and be wrong.
+        """
         n = transformed_actions.shape[0]
         padded = self._pad_actions(transformed_actions.reshape(n, -1))
-        dummy_state = np.zeros((n, self.model_config.action_dim), dtype=np.float32)
+        if state is None:
+            ref_state = np.zeros((n, self.model_config.action_dim), dtype=np.float32)
+        else:
+            ref_state = np.asarray(state, dtype=np.float32).reshape(-1, self.model_config.action_dim)
+            if ref_state.shape[0] == 1 and n > 1:
+                ref_state = np.ascontiguousarray(
+                    np.broadcast_to(ref_state, (n, self.model_config.action_dim))
+                )
         output_dict = {
-            "state": dummy_state,
+            "state": ref_state,
             "actions": np.array(padded),
         }
         processed = [

@@ -2,7 +2,7 @@
 
 source .venv/bin/activate
 
-REPO_ID="expo_ft/droid_pick_cube_10"
+REPO_ID="cr5af/shaft_insert"
 
 uv run expo_ft/agents/vla/openpi/scripts/compute_norm_stats.py \
     --config-name expo_pi05_droid_lora_finetune_sft_cartesian_state \

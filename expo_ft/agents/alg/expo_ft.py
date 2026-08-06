@@ -628,10 +628,13 @@ class EXPOLearner(AgentLearner, struct.PyTreeNode):
         return jnp.array(action), self.replace(rng=rng), sample_info
 
     def sample_batch_actions(self, batch):
-        critic_obs = jnp.squeeze(batch["next_observations"])
+        # next_observations is (B, H, W, 6) and next_states is (B, state_dim);
+        # neither carries a spurious singleton axis, so squeeze would only ever
+        # collapse the batch dim when B==1. Keep the batch dim explicit.
+        critic_obs = batch["next_observations"]
         critic_obs = jax.device_put(critic_obs)
         batch_size = critic_obs.shape[0]
-        states = jnp.squeeze(batch["next_states"])
+        states = batch["next_states"]
         states = jax.device_put(states, self.data_sharding)
         rng = self.rng
 
@@ -718,7 +721,7 @@ class EXPOLearner(AgentLearner, struct.PyTreeNode):
         }
 
         rng, _ = jax.random.split(rng, 2)
-        return jnp.array(best_actions.squeeze()), sample_info_extra, rng
+        return jnp.array(best_actions), sample_info_extra, rng
          
     def update_residual_actor(self, batch: DatasetDict) -> Tuple[AgentLearner, Dict[str, float]]:
         key, rng = jax.random.split(self.rng)
@@ -897,22 +900,27 @@ class EXPOLearner(AgentLearner, struct.PyTreeNode):
 
 
     def update(self, agent, batch: DatasetDict, utd_ratio: int, actor_batch: DatasetDict = None):
+        # `agent` is always `self` (call convention is `agent.update(agent, ...)`); the extra
+        # arg is kept only for backward compat. Passing it into the jitted core made the
+        # ~3.3B-param Pi0 actor a jit argument TWICE (self + agent), ~26GB of redundant I/O
+        # that OOM'd a single 32GB GPU. Pass only `self`, and donate it (donate_argnums=0) so
+        # XLA reuses the input param buffers for the output instead of allocating a 2nd copy.
         # Drop stale inference copies before JIT; rebuild after so rollouts use new weights.
         new_agent, info = self.replace(_infer_cache=None)._update_jit(
-            agent.replace(_infer_cache=None), batch, utd_ratio, actor_batch
+            batch, utd_ratio, actor_batch
         )
         return new_agent.cache_infer_params(), info
 
 
-    @partial(jax.jit, static_argnames="utd_ratio")
-    def _update_jit(self, agent, batch: DatasetDict, utd_ratio: int, actor_batch: DatasetDict = None):
+    @partial(jax.jit, static_argnames="utd_ratio", donate_argnums=0)
+    def _update_jit(self, batch: DatasetDict, utd_ratio: int, actor_batch: DatasetDict = None):
         batch = batch.copy()
-        rng, key1 = jax.random.split(agent.rng)
+        rng, key1 = jax.random.split(self.rng)
         rng, key2 = jax.random.split(rng)
         batch["image"] = self.data_augmentation_fn(key1, batch["image"])
         batch["next_image"] = self.data_augmentation_fn(key2, batch["next_image"])
         batch = prepare_critic_batch(batch, self.actor.model_config.action_dim, self.action_dim, self.state_dim, self.action_horizon, self.replan_steps)
-        new_agent = agent.replace(rng=rng)
+        new_agent = self.replace(rng=rng)
 
         total_bs = batch["actions"].shape[0]
         assert total_bs % utd_ratio == 0, (

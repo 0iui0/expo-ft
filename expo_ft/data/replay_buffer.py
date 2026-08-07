@@ -399,17 +399,23 @@ class PiReplayBuffer(Dataset):
             _prev_masks = jax_dataset_dict["masks"].copy()
 
         def to_jax_array(x):
-            """Recursively convert numpy arrays to JAX arrays, handling nested dicts."""
+            """Keep the sampled batch as numpy (CPU) so apply_data_sharding can move it
+            directly to the data_sharding device. The previous `jnp.asarray(x)` created
+            every leaf on the DEFAULT device (GPU0 = sampling card), which materialized
+            the ~735 MiB critic batch on GPU0 (already full of the 3.3B sampling cache)
+            and OOM'd before apply_data_sharding could move it to GPU1. numpy leaves
+            work because _convert_to_openpi_format only uses .dtype/.astype and
+            apply_data_sharding uses make_array_from_process_local_data (CPU source)."""
             if isinstance(x, dict):
                 return {k: to_jax_array(v) for k, v in x.items()}
             elif isinstance(x, (np.ndarray, np.generic)):
-                return jnp.asarray(x)
+                return np.asarray(x)
             else:
                 try:
-                    return jnp.asarray(x)
+                    return np.asarray(x)
                 except (TypeError, ValueError):
                     return x
-        
+
         jax_dataset_dict = to_jax_array(jax_dataset_dict)
         
         return jax_dataset_dict

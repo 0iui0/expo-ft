@@ -43,6 +43,15 @@ def initialize_checkpoint_dir(
             max_to_keep=100,
             keep_period=keep_period,
             create=False,
+            # Async checkpointing spawns orbax asyncio worker threads at manager
+            # creation. With async enabled, these race with the SFT checkpoint
+            # restore in build_pi05 (restore_params -> orbax batched_device_put),
+            # causing a flaky std::bad_alloc / std::system_error during startup.
+            # Disabling async here makes the manager's handler infrastructure
+            # synchronous so it doesn't conflict with the initial restore. Saves
+            # become blocking (acceptable: infrequent, and checkpoint_model=False
+            # for dry-runs). Validated: 3/3 clean restores vs 5/5 crashes.
+            enable_async_checkpointing=False,
             async_options=ocp.AsyncOptions(timeout_secs=7200),
         ),
     )

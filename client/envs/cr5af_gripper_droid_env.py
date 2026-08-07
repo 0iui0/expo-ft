@@ -75,7 +75,12 @@ class CR5AFGripperDroidEnv:
 
     # ── action: 10D DROID cartesian -> 16D CR5AF absolute target ────────────
     def step(self, action: np.ndarray) -> Dict[str, Any]:
-        return self._env.step(_cartesian10d_to_eef16(action))
+        self._env.step(_cartesian10d_to_eef16(action))
+        # Return the 10D DROID action as executed_action (NOT the wrapped env's
+        # 16D eef target): the replay buffer / norm_stats are in the 10D DROID
+        # action space [xyz_m, rot6d, gripper], so an inserted transition must
+        # carry the 10D action or Normalize broadcasts (16,) vs (10,) and crashes.
+        return {"executed_action": np.asarray(action, dtype=np.float64)}
 
     # ── delegate everything else to the wrapped env ─────────────────────────
     def __getattr__(self, name: str) -> Any:

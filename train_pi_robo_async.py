@@ -311,7 +311,7 @@ def main(_):
                 )
 
                 with _publish_lock:
-                    _published[0] = learner_agent._infer_cache
+                    _published[0] = learner_agent
 
                 update_time.append(time.time() - t0)
                 _update_count[0] += 1
@@ -361,10 +361,17 @@ def main(_):
         _env_step[0] = i
 
         with _publish_lock:
-            new_cache = _published[0]
+            new_agent = _published[0]
             _published[0] = None
-        if new_cache is not None:
-            _actor_agent = _actor_agent.replace(_infer_cache=new_cache)
+        if new_agent is not None:
+            # Free the old GPU0 inference cache BEFORE building the new one. On
+            # dual-GPU, cache_infer_params device_puts the ~3.3B actor GPU1->GPU0;
+            # building it while the previous cache is still held by _actor_agent
+            # makes old + new coexist on the sampling card and OOMs. Dropping the old
+            # cache first (single-threaded here) lets jax free those GPU0 buffers
+            # before the new copy is allocated. Costs ~0.4s/transfer, once per update.
+            _actor_agent = _actor_agent.replace(_infer_cache=None)
+            _actor_agent = new_agent.cache_infer_params()
 
         observation = env.get_observation()
         done, success, reward, mask = env.get_info_for_step()

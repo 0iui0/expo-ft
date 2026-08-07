@@ -905,11 +905,16 @@ class EXPOLearner(AgentLearner, struct.PyTreeNode):
         # ~3.3B-param Pi0 actor a jit argument TWICE (self + agent), ~26GB of redundant I/O
         # that OOM'd a single 32GB GPU. Pass only `self`, and donate it (donate_argnums=0) so
         # XLA reuses the input param buffers for the output instead of allocating a 2nd copy.
-        # Drop stale inference copies before JIT; rebuild after so rollouts use new weights.
+        # Drop stale inference copies before JIT.
         new_agent, info = self.replace(_infer_cache=None)._update_jit(
             batch, utd_ratio, actor_batch
         )
-        return new_agent.cache_infer_params(), info
+        # Do NOT build the GPU0 inference cache here. On dual-GPU, cache_infer_params
+        # device_puts the ~3.3B actor GPU1->GPU0 (a real cross-device copy); doing it in
+        # the update thread while the main thread still holds the previous cache makes
+        # old + new coexist on the sampling card and OOMs. The main thread rebuilds the
+        # cache at swap time, after freeing the old one. Return with _infer_cache cleared.
+        return new_agent.replace(_infer_cache=None), info
 
 
     @partial(jax.jit, static_argnames="utd_ratio", donate_argnums=0)

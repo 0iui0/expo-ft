@@ -388,8 +388,15 @@ class Pi05Agent(Model):
 
     def process_raw_inputs(self, raw_observations, action_dim, resize_size, normalize=True):
         """Convert raw env observations into a batched model-ready Observation dict."""
-        # create a dummy actions
-        raw_observations["actions"] = np.zeros(action_dim)
+        # A placeholder "actions" key is required: RepackTransform's structure includes
+        # "actions" and does flat_item["actions"] unconditionally, and the env observation
+        # carries no actions (this is the inference path). The value is discarded —
+        # Observation.from_dict ignores actions and the model samples its own — so zeros
+        # are fine. The shape MUST be 2-D (horizon, dim): DeltaActions does
+        # `actions[..., :dims] -= np.expand_dims(state[..., :dims], -2)`, which broadcasts
+        # the 1-D state over a horizon axis; a 1-D placeholder crashes with a
+        # non-broadcastable (10,) vs (1, 10) error.
+        raw_observations["actions"] = np.zeros((self.model_config.action_horizon, action_dim))
         for key, value in raw_observations.items():
             raw_observations[key] = np.asarray(value)
             if "image" in key:

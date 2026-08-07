@@ -1,6 +1,13 @@
 #! /usr/bin/env python
 import os
 import logging
+
+# RTX 5090 (sm_120) + selfbuilt jaxlib: XLA conv autotune selects a cuDNN algo that
+# segfaults during compile of the critic's ResNetV2 encoder (the real (3,4,6,3)/64
+# config; the shrunk smoke-test encoder does not trigger it). Disabling autotune
+# makes XLA use a default algo — slightly slower, but crash-free. Must be set before
+# jax/jaxlib initialise, so it is set here, before `import jax`. Overridable via env.
+os.environ.setdefault("XLA_FLAGS", "--xla_gpu_autotune_level=0")
 import time
 import threading
 from collections import deque

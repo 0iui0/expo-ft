@@ -107,6 +107,7 @@ class CR5AFGripperEnv:
         control_hz: float = 30.0,
         language_instruction: str = "grasp motor shaft and insert into bushing",
         video_dir: str = "",
+        dry_run: bool = False,
         **kwargs,
     ):
         self._robot_ip = robot_ip
@@ -115,6 +116,11 @@ class CR5AFGripperEnv:
         self._image_size = image_size
         self._speed_pct = speed
         self._translation_only = translation_only
+        # dry_run: connect RT telemetry + cameras (so observations flow) but skip
+        # the command socket, _enable_robot, and all motion (ServoP/ServoJ/gripper).
+        # The robot never moves. Used to validate the online obs/sample/step path
+        # without actuating the arm.
+        self._dry_run = dry_run
         # Joint-space control (InverseKin + ServoJ) avoids the wrist-singularity
         # (joint5≈90°) Cartesian planner throttle that freezes ServoP. max_joint_vel
         # (deg/s) is the per-joint safety cap applied to each ServoJ delta.
@@ -147,8 +153,9 @@ class CR5AFGripperEnv:
         # ── command socket (port 29999) ────────────────────────────────────
         self._cmd_sock: Optional[socket.socket] = None
         self._cmd_lock = threading.Lock()
-        self._connect_cmd()
-        self._enable_robot()
+        if not self._dry_run:
+            self._connect_cmd()
+            self._enable_robot()
 
         # ── cameras (RealSense) ────────────────────────────────────────────
         self._cam_hand = None
@@ -364,6 +371,8 @@ class CR5AFGripperEnv:
         canonical branch (joint6 wraps ~360° off the current ~-198°), crossing a
         joint soft limit -> ErrorID -5 on every command. Streaming at a tight
         cadence keeps servo engaged and seeded at the current joints."""
+        if self._dry_run:
+            return
         cmd = (f"ServoP({x_mm:.3f},{y_mm:.3f},{z_mm:.3f},"
                f"{rx_deg:.3f},{ry_deg:.3f},{rz_deg:.3f})")
         with self._cmd_lock:
@@ -375,6 +384,8 @@ class CR5AFGripperEnv:
 
     def _runscript(self, project: str):
         """Trigger a DobotStudio project via RunScript."""
+        if self._dry_run:
+            return
         self._send_cmd(f'RunScript("{project}")', read_response=False)
 
     # ── joint-space control (InverseKin + ServoJ) ───────────────────────────
@@ -424,6 +435,8 @@ class CR5AFGripperEnv:
         """Realize a Cartesian target in joint space: InverseKin (biased to the
         current config) -> per-joint unwrap + rate clamp -> ServoJ. Sidesteps the
         Cartesian wrist singularity that throttles ServoP. Holds if IK fails."""
+        if self._dry_run:
+            return
         j_targ = self._inverse_kin(target_xyz_mm[0], target_xyz_mm[1], target_xyz_mm[2],
                                    target_rot_deg[0], target_rot_deg[1], target_rot_deg[2],
                                    cur_q_deg)
@@ -536,16 +549,18 @@ class CR5AFGripperEnv:
         # servo command is refused with -5 (and ClearError can't clear the alarm
         # while the joint stays out of range). Fail fast, naming the joint(s), so
         # the operator jogs it back instead of watching a run silently freeze.
-        with self._lock:
-            q_deg = np.degrees(self._q.copy())
-        over = np.abs(q_deg) > (JOINT_LIMITS_DEG + JOINT_LIMIT_TOL_DEG)
-        if over.any():
-            bad = ", ".join(f"J{i + 1}={q_deg[i]:.1f}°(limit ±{JOINT_LIMITS_DEG[i]:.0f}°)"
-                            for i in np.where(over)[0])
-            raise RuntimeError(
-                f"joint(s) parked past soft limit: {bad}. Jog them back within "
-                f"range on the pendant before deploying — servo commands would "
-                f"be refused with ErrorID -5.")
+        # Skipped in dry_run (no motion -> limits irrelevant).
+        if not self._dry_run:
+            with self._lock:
+                q_deg = np.degrees(self._q.copy())
+            over = np.abs(q_deg) > (JOINT_LIMITS_DEG + JOINT_LIMIT_TOL_DEG)
+            if over.any():
+                bad = ", ".join(f"J{i + 1}={q_deg[i]:.1f}°(limit ±{JOINT_LIMITS_DEG[i]:.0f}°)"
+                                for i in np.where(over)[0])
+                raise RuntimeError(
+                    f"joint(s) parked past soft limit: {bad}. Jog them back within "
+                    f"range on the pendant before deploying — servo commands would "
+                    f"be refused with ErrorID -5.")
 
         # Open gripper
         try:

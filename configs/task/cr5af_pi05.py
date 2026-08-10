@@ -38,9 +38,15 @@ def get_config():
 
     # ── robot connection ───────────────────────────────────────────────────
     config.robot_ip = "192.168.5.1"
-    config.speed = 50.0  # motion speed percentage (0-100)
+    config.speed = 30.0  # motion speed percentage (0-100); lowered from 50 for joint-speed margin
     config.translation_only = True  # lock orientation in env.step()
     config.control_hz = 8  # RL control loop rate → env step() dt = 1/control_hz
+    # Joint-space control (InverseKin + ServoJ with a hard per-joint velocity clamp)
+    # bypasses the Cartesian ServoP planner, which near a wrist singularity plans
+    # joint4/6 velocities up to the 234°/s safety limit → e-stop. ServoJ commands
+    # clamped joint deltas directly, so no joint can exceed max_joint_vel.
+    config.joint_space = True
+    config.max_joint_vel = 90.0  # deg/s hard cap (11.25°/step @ 8Hz); 2.6× below the 234°/s limit
 
     # ── cameras ──────────────────────────────────────────────────────────
     config.camera_serial_hand = "260322277798"   # D405 wrist camera

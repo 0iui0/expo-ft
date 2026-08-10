@@ -55,6 +55,11 @@ EEF9D_SLICE = slice(0, 9)
 JOINT_SLICE = slice(9, 15)
 GRIPPER_IDX = 15
 
+# Workspace safety bounds (mm) — clamp ServoP xyz targets so the arm can't be
+# driven out of the proven box (matches deploy_cr5af_gripper / the recorder).
+WORKSPACE_MIN_MM = np.array([369.0, -245.0, 110.0], dtype=np.float64)
+WORKSPACE_MAX_MM = np.array([820.0, 299.0, 442.0], dtype=np.float64)
+
 # CR5AF joint soft limits (deg), read off the controller pendant: only J3 is
 # narrow (±160°); all others are ±360°. reset() checks the parked joints against
 # these — a joint parked past its limit makes the controller refuse EVERY servo
@@ -159,6 +164,11 @@ class CR5AFGripperEnv:
         self._rt_valid = False
         self._rt_last_ts = 0.0
         self._rt_first_logged = False
+        # HIL state: BTN_1 (right) = deadman (hold to teleop the arm); BTN_0
+        # (left) = gripper toggle (rising edge flips open/close). Matches the
+        # record_demo_gripper convention.
+        self._hil_grip = 1.0          # HIL gripper intent (1=open, 0=closed)
+        self._prev_btn0 = False
 
         # ── RT feed (port 30004) ───────────────────────────────────────────
         self._rt_sock: Optional[socket.socket] = None
@@ -683,31 +693,36 @@ class CR5AFGripperEnv:
             self._rt_valid = False  # require a fresh frame before resuming
             return {"executed_action": action.astype(np.float64), "action_type": "policy"}
 
-        # ── HIL: spacemouse can override the policy (human takeover) ────────
-        # Matches record_demo_gripper.py (line 958-967):
-        #   tdelta = [tx, ty, -tz] * action_scale   (tz NEGATED)
-        #   deadzone on max|translation| (recorder dead_zone)
-        # Rate-mode here (target = cur + delta) vs the recorder's integrated
-        # p_nom — equivalent feel when the per-step clamp doesn't limit.
+        # ── HIL: spacemouse takeover (matches record_demo_gripper) ──────────
+        # BTN_1 (right) = DEADMAN: hold to teleop the arm. Released -> policy
+        # resumes. Held but not pushing -> HOLD (no motion). Immediate takeover
+        # on press (the user's request).
+        # BTN_0 (left) = gripper toggle (rising edge flips open/close).
+        # Translation: [tx, ty, -tz]*scale (tz negated, recorder line 965).
         action_type = "policy"
-        hil_trans = False  # only true when the human is pushing (translation override)
+        hil_trans = False
         if self._spacemouse is not None:
             sm_axes, sm_btns = self._spacemouse.read()
-            if np.max(np.abs(sm_axes[:3])) > 0.1:  # deadzone (recorder: 0.3)
-                # [tx, ty, -tz] — tz negated to match the recorder's base-frame mapping
-                sm_delta = np.array([sm_axes[0], sm_axes[1], -sm_axes[2]], dtype=np.float64)
-                action[0:3] = cur_pos[:3] + sm_delta * self._sm_lin_scale
-                hil_trans = True
+            btn0, btn1 = bool(sm_btns[0]), bool(sm_btns[1])
+            # BTN_0 rising edge -> toggle HIL gripper
+            if btn0 and not self._prev_btn0:
+                self._hil_grip = 0.0 if self._hil_grip >= 0.5 else 1.0
+                logger.info("[HIL] gripper toggle -> %s",
+                            "open" if self._hil_grip >= 0.5 else "close")
+            self._prev_btn0 = btn0
+            # BTN_1 = deadman
+            if btn1:
                 action_type = "human"
-            if sm_btns[0]:        # BTN_0 -> close
-                action[GRIPPER_IDX] = 0.0
-                action_type = "human"
-            elif sm_btns[1]:      # BTN_1 -> open
-                action[GRIPPER_IDX] = 1.0
-                action_type = "human"
-            if action_type == "human":
-                logger.info("[HIL] takeover: trans=%s btns=%s hil_trans=%s",
-                            np.round(sm_axes[:3], 2).tolist(), sm_btns, hil_trans)
+                action[GRIPPER_IDX] = self._hil_grip
+                if np.max(np.abs(sm_axes[:3])) > 0.1:  # pushing -> override xyz
+                    sm_delta = np.array([sm_axes[0], sm_axes[1], -sm_axes[2]], dtype=np.float64)
+                    action[0:3] = cur_pos[:3] + sm_delta * self._sm_lin_scale
+                    hil_trans = True
+                else:
+                    action[0:3] = cur_pos[:3]  # deadman held, not pushing -> hold
+                logger.info("[HIL] deadman: trans=%s hil_trans=%s grip=%s",
+                            np.round(sm_axes[:3], 2).tolist(), hil_trans,
+                            "open" if self._hil_grip >= 0.5 else "close")
 
         # ServoP takes an ABSOLUTE Cartesian target pose (mm, deg), NOT a
         # velocity. (Confirmed on hardware: feeding velocities makes the robot
@@ -725,6 +740,8 @@ class CR5AFGripperEnv:
         max_mms = 200.0 if hil_trans else 50.0
         pos_delta_mm = np.clip(targ_xyz_mm - cur_xyz_mm, -max_mms * dt, max_mms * dt)
         target_xyz_mm = cur_xyz_mm + pos_delta_mm
+        # Workspace safety: never let the target leave the proven box.
+        target_xyz_mm = np.clip(target_xyz_mm, WORKSPACE_MIN_MM, WORKSPACE_MAX_MM)
 
         # ── orientation target (deg, native tool axis-angle) ─────────────────
         if self._translation_only:

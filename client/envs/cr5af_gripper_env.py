@@ -105,6 +105,8 @@ class CR5AFGripperEnv:
         max_joint_vel: float = 120.0,
         max_rot_vel: float = 8.0,
         control_hz: float = 30.0,
+        use_spacemouse: bool = True,
+        sm_lin_scale: float = 0.3,
         language_instruction: str = "grasp motor shaft and insert into bushing",
         video_dir: str = "",
         dry_run: bool = False,
@@ -170,6 +172,17 @@ class CR5AFGripperEnv:
             self._connect_cmd()
             self._enable_robot()
             self._gripper_init()  # DHGripInit — REQUIRED before grip_open/close actuate
+        # SpaceMouse for HIL (human takeover). Optional — if absent, policy only.
+        self._sm_lin_scale = sm_lin_scale
+        self._spacemouse = None
+        if use_spacemouse and not self._dry_run:
+            try:
+                from client.real_utils.spacemouse_hil import HidrawSpaceMouse
+                self._spacemouse = HidrawSpaceMouse()
+                logger.info("[SPACEMOUSE] connected (HIL enabled)")
+            except Exception as e:
+                logger.warning("[SPACEMOUSE] unavailable (%s) — HIL disabled, policy only", e)
+                self._spacemouse = None
 
         # ── cameras (RealSense) ────────────────────────────────────────────
         self._cam_hand = None
@@ -668,7 +681,26 @@ class CR5AFGripperEnv:
                    else "RT joints all-zero (blind)")
             logger.warning("[HOLD-BLIND] %s — refusing to move (no servo/gripper)", why)
             self._rt_valid = False  # require a fresh frame before resuming
-            return {"executed_action": action.astype(np.float64)}
+            return {"executed_action": action.astype(np.float64), "action_type": "policy"}
+
+        # ── HIL: spacemouse can override the policy (human takeover) ────────
+        # When the human pushes the spacemouse (translation above deadzone) or
+        # presses a gripper button, override the policy's target. The human's
+        # target is recorded as executed_action so the replay buffer stores HIL
+        # transitions (action_type="human") for bootstrapping.
+        action_type = "policy"
+        if self._spacemouse is not None:
+            sm_axes, sm_btns = self._spacemouse.read()
+            if np.linalg.norm(sm_axes[:3]) > 0.15:  # human pushing -> override xyz
+                # target = current + human delta (the 50 mm/s clamp below caps it)
+                action[0:3] = cur_pos[:3] + sm_axes[:3] * (self._sm_lin_scale * self._dt)
+                action_type = "human"
+            if sm_btns[0]:        # BTN_0 -> close
+                action[GRIPPER_IDX] = 0.0
+                action_type = "human"
+            elif sm_btns[1]:      # BTN_1 -> open
+                action[GRIPPER_IDX] = 1.0
+                action_type = "human"
 
         # ServoP takes an ABSOLUTE Cartesian target pose (mm, deg), NOT a
         # velocity. (Confirmed on hardware: feeding velocities makes the robot
@@ -734,7 +766,7 @@ class CR5AFGripperEnv:
             self._gripper_open()
 
         self._steps_since_reset += 1
-        return {"executed_action": action.astype(np.float64)}
+        return {"executed_action": action.astype(np.float64), "action_type": action_type}
 
     def get_info_for_step(self) -> Tuple[bool, bool, float, float]:
         # Manual success via keyboard (from client.real_utils.detector)

@@ -75,12 +75,15 @@ class CR5AFGripperDroidEnv:
 
     # ── action: 10D DROID cartesian -> 16D CR5AF absolute target ────────────
     def step(self, action: np.ndarray) -> Dict[str, Any]:
-        self._env.step(_cartesian10d_to_eef16(action))
-        # Return the 10D DROID action as executed_action (NOT the wrapped env's
-        # 16D eef target): the replay buffer / norm_stats are in the 10D DROID
-        # action space [xyz_m, rot6d, gripper], so an inserted transition must
-        # carry the 10D action or Normalize broadcasts (16,) vs (10,) and crashes.
-        return {"executed_action": np.asarray(action, dtype=np.float64)}
+        result = self._env.step(_cartesian10d_to_eef16(action))
+        executed_16d = np.asarray(result["executed_action"], dtype=np.float64)
+        action_type = result.get("action_type", "policy")
+        # Return the EXECUTED 10D action (may be the human's HIL target, not the
+        # policy's): 16D [eef_9d(xyz_m, rot6d), joint(6), gripper] -> 10D
+        # [xyz_m, rot6d, gripper]. The replay buffer / norm_stats are in this 10D
+        # DROID action space, so an inserted transition must carry it.
+        executed_10d = np.concatenate([executed_16d[:9], executed_16d[15:16]]).astype(np.float64)
+        return {"executed_action": executed_10d, "action_type": action_type}
 
     # ── delegate everything else to the wrapped env ─────────────────────────
     def __getattr__(self, name: str) -> Any:

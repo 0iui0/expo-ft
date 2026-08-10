@@ -58,33 +58,9 @@ _env_storage: Dict[str, Any] = {}
 _config_task_path: Optional[str] = None
 _task_config: Optional[Any] = None
 
-# Human-in-the-loop: lazy spacemouse for droid envs
-_spacemouse_policy: Optional[Any] = None
-_HUMAN_OVERRIDE_NORM_THRESHOLD = 1e-4
-
-
-def _get_human_override_action(task_config: Optional[Any] = None) -> tuple:
-    """Return (action_7d or None, is_human). Assumes 7D action space."""
-    global _spacemouse_policy
-    # If init previously failed (no spacemouse / no HIL), don't retry every step
-    # — that spammed "Spacemouse unavailable" at control rate. Skip silently.
-    if _spacemouse_policy is False:
-        return None, False
-    try:
-        if _spacemouse_policy is None:
-            from client.real_utils.spacemouse import SpaceMousePolicy
-            _spacemouse_policy = SpaceMousePolicy(
-                max_lin_vel=task_config.collect_max_lin_vel,
-                max_rot_vel=task_config.collect_max_rot_vel,
-            )
-        action_7d, _ = _spacemouse_policy.forward(None, include_info=True)
-        is_active = np.linalg.norm(action_7d[:6]) > _HUMAN_OVERRIDE_NORM_THRESHOLD
-        return (action_7d, True) if is_active else (None, False)
-    except Exception as e:
-        logging.getLogger(__name__).warning(
-            "Spacemouse unavailable (%s) — using policy action; suppressing further attempts.", e)
-        _spacemouse_policy = False  # cache failure; stop retrying every step
-        return None, False
+# HIL (spacemouse takeover) is now handled INSIDE the env's step() (it has the
+# current state to apply the human delta). The env returns action_type
+# ("human"/"policy"); this server just forwards it. See cr5af_gripper_env.step.
 
 
 async def _handle_environment_request(websocket: _server.ServerConnection):
@@ -148,24 +124,19 @@ async def _handle_environment_request(websocket: _server.ServerConnection):
                                 "Check policy inputs (observations, encoder), training stability, or checkpoint."
                             )
                             sent_action = np.where(np.isfinite(sent_action), sent_action, 0.0)
-                        real_action = sent_action.copy()
-                        action_type = "policy"
-                        is_human = False
-                        if _task_config is not None and _task_config.env_type == "droid":
-                            sm_action, is_human = _get_human_override_action(_task_config)
-                            if is_human and sm_action is not None:
-                                real_action[:6] = sm_action[:6]
-                                real_action[6] = sm_action[6]
-                                action_type = "human"
                         sent_is_invalid = np.allclose(sent_action, -1.0)
-                        if is_human or not sent_is_invalid:
-                            step_result = env.step(real_action)
+                        # The env does HIL (spacemouse takeover) internally and
+                        # returns action_type ("human"/"policy"). No override here.
+                        if not sent_is_invalid:
+                            step_result = env.step(sent_action)
                             executed_action = np.array(
                                 step_result["executed_action"],
                                 dtype=np.float64,
                             )
+                            action_type = step_result.get("action_type", "policy")
                         else:
-                            executed_action = real_action
+                            executed_action = sent_action
+                            action_type = "policy"
 
                         response = {
                             "status": "success",

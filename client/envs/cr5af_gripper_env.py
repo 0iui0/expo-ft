@@ -116,6 +116,13 @@ class CR5AFGripperEnv:
         self._image_size = image_size
         self._speed_pct = speed
         self._translation_only = translation_only
+        # Held orientation for translation_only mode: captured ONCE per episode and
+        # reused. The LIVE RT axis-angle triple flips sign near |rot|=180° (the arm
+        # sits at rx≈-179°), so re-reading it each step makes ServoP see a 358° jump
+        # → planner rotates the long way → joint4/6 speed spikes past the 234°/s
+        # limit (e-stop) and the wrist visibly rotates. A one-time capture is
+        # flip-free: the target is byte-constant every step.
+        self._held_rot_deg = None
         # dry_run: connect RT telemetry + cameras (so observations flow) but skip
         # the command socket, _enable_robot, and all motion (ServoP/ServoJ/gripper).
         # The robot never moves. Used to validate the online obs/sample/step path
@@ -544,6 +551,11 @@ class CR5AFGripperEnv:
         self.done = False
         self.success = False
         self.reward = 0.0
+        self._held_rot_deg = None  # re-capture held orientation this episode
+        logger.info("[ENV-CFG] translation_only=%s joint_space=%s speed=%.0f "
+                    "control_hz=%.1f dry_run=%s",
+                    self._translation_only, self._joint_space, self._speed_pct,
+                    1.0 / self._dt, self._dry_run)
 
         # Joint-limit self-check: if the arm is parked past a soft limit, every
         # servo command is refused with -5 (and ClearError can't clear the alarm
@@ -597,13 +609,17 @@ class CR5AFGripperEnv:
 
         # ── orientation target (deg, native tool axis-angle) ─────────────────
         if self._translation_only:
-            # Feed the controller's OWN measured tool triple straight back (mirror
-            # the recorder). Re-deriving it via as_rotvec(from_quat(...)) flips the
-            # axis-angle sign near |rot|=180° (the arm sits at rx≈-179°), so the
-            # "held" orientation jumps step-to-step and — amplified by the wrist
-            # singularity (J5≈90°) — spikes joint6 planning speed past its limit.
-            # The raw triple is byte-constant while orientation is held -> no spike.
-            target_rot_deg = cur_tcp_rxyz
+            # Hold orientation by CAPTURING the tool triple once per episode and
+            # reusing it. The LIVE RT axis-angle triple flips sign near |rot|=180°
+            # (the arm sits at rx≈-179°): re-reading it each step makes ServoP see
+            # a 358° jump → the planner rotates the long way → joint4/6 planning
+            # speed spikes past the 234°/s limit (e-stop) and the wrist visibly
+            # rotates. A one-time capture is flip-free (constant target every step).
+            if self._held_rot_deg is None:
+                self._held_rot_deg = cur_tcp_rxyz.copy()
+                logger.info("[HOLD-ORIENT] captured held orientation rxyz_deg=%s",
+                            self._held_rot_deg.tolist())
+            target_rot_deg = self._held_rot_deg
         elif self._joint_space:
             # Absolute policy orientation target. In joint-space mode the
             # per-joint ServoJ clamp below is the hard rate limit near the wrist

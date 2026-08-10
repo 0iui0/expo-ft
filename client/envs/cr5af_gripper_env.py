@@ -151,6 +151,12 @@ class CR5AFGripperEnv:
         self._gripper_pos = 1.0  # 1=open, 0=closed
         self._robot_mode: int = 0
         self._connected = False
+        # RT validity gate. Until the RT thread parses a real frame (and it stays
+        # fresh), step() REFUSES to move — no servo, no gripper. Operating blind
+        # (zero RT state) computes targets near the origin → wild motion → e-stop.
+        self._rt_valid = False
+        self._rt_last_ts = 0.0
+        self._rt_first_logged = False
 
         # ── RT feed (port 30004) ───────────────────────────────────────────
         self._rt_sock: Optional[socket.socket] = None
@@ -287,6 +293,16 @@ class CR5AFGripperEnv:
             self._eef_9d = np.concatenate([xyz, _matrix_to_rot6d(rot.as_matrix())]).astype(np.float32)
             self._joint_pos = self._q.astype(np.float32)
             self._robot_mode = struct.unpack_from("<Q", data, RT_ROBOT_MODE)[0]
+        # Mark RT valid + fresh. step() gates ALL motion on this — operating
+        # blind (zero RT) computes targets near the origin → wild motion → e-stop.
+        self._rt_valid = True
+        self._rt_last_ts = time.time()
+        if not self._rt_first_logged:
+            self._rt_first_logged = True
+            logger.info("[RT-FIRST] valid frame: joints(deg)=%s xyz_mm=%s rxyz_deg=%s",
+                        np.round(np.degrees(q), 1).tolist(),
+                        np.round(np.asarray(tv[:3]), 1).tolist(),
+                        np.round(np.asarray(tv[3:6]), 1).tolist())
 
     # ═══════════════════════════════════════════════════════════════════════
     # Command socket (port 29999)
@@ -593,6 +609,19 @@ class CR5AFGripperEnv:
             cur_tcp_rxyz = self._tcp_rxyz_deg.copy()  # native tool triple (deg)
             cur_q_deg = np.degrees(self._q.copy())  # current joints (deg)
             cur_grip = self._gripper_pos
+
+        # ── fail-safe: never move blind ─────────────────────────────────────
+        # If no valid RT frame has arrived (or it's stale, or the joints read as
+        # all-zero), the state cache is zeros/stale → targets compute near the
+        # origin → wild motion → e-stop. Hold instead: no servo, no gripper.
+        rt_age = time.time() - self._rt_last_ts if self._rt_last_ts else 1e9
+        if (not self._rt_valid) or rt_age > 3.0 or np.allclose(cur_q_deg, 0.0):
+            why = ("no valid RT frame" if not self._rt_valid
+                   else f"RT stale {rt_age:.1f}s" if rt_age > 3.0
+                   else "RT joints all-zero (blind)")
+            logger.warning("[HOLD-BLIND] %s — refusing to move (no servo/gripper)", why)
+            self._rt_valid = False  # require a fresh frame before resuming
+            return {"executed_action": action.astype(np.float64)}
 
         # ServoP takes an ABSOLUTE Cartesian target pose (mm, deg), NOT a
         # velocity. (Confirmed on hardware: feeding velocities makes the robot

@@ -169,6 +169,7 @@ class CR5AFGripperEnv:
         if not self._dry_run:
             self._connect_cmd()
             self._enable_robot()
+            self._gripper_init()  # DHGripInit — REQUIRED before grip_open/close actuate
 
         # ── cameras (RealSense) ────────────────────────────────────────────
         self._cam_hand = None
@@ -435,10 +436,14 @@ class CR5AFGripperEnv:
                 logger.warning("servop error: %s", e)
 
     def _runscript(self, project: str):
-        """Trigger a DobotStudio project via RunScript."""
+        """Trigger a DobotStudio project via RunScript.
+
+        Project name is UNQUOTED — matches the proven record_demo_gripper
+        (RunScript(grip_open), not RunScript(\"grip_open\")); the controller
+        rejects the quoted form."""
         if self._dry_run:
             return
-        resp = self._send_cmd(f'RunScript("{project}")', read_response=True, timeout=2.0)
+        resp = self._send_cmd(f"RunScript({project})", read_response=True, timeout=5.0)
         err = resp.split(",", 1)[0].strip() if resp else "(no reply)"
         logger.info("[GRIPPER] RunScript(%s) -> ErrorID=%s", project, err)
 
@@ -547,6 +552,17 @@ class CR5AFGripperEnv:
     # ═══════════════════════════════════════════════════════════════════════
     # Gripper (RunScript mode — binary open/close)
     # ═══════════════════════════════════════════════════════════════════════
+
+    def _gripper_init(self):
+        """Run the DHGripInit project once (blocking homing move, ~5s).
+
+        REQUIRED before grip_open/grip_close actuate — the DHGrip plugin must be
+        initialized. Mirrors record_demo_gripper's gripper.initialize()
+        (RunScript(grip_init) -> DHGripInit)."""
+        self._wait_idle()
+        self._runscript("grip_init")
+        self._wait_idle()
+        logger.info("[GRIPPER] initialized (grip_init / DHGripInit done)")
 
     def _gripper_open(self):
         self._wait_idle()

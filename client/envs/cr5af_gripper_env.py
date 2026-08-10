@@ -106,7 +106,7 @@ class CR5AFGripperEnv:
         max_rot_vel: float = 8.0,
         control_hz: float = 30.0,
         use_spacemouse: bool = True,
-        sm_lin_scale: float = 0.3,
+        sm_lin_scale: float = 0.01,  # m per unit per step (recorder action_scale=8mm; 10mm @ 8Hz ≈ 80mm/s)
         language_instruction: str = "grasp motor shaft and insert into bushing",
         video_dir: str = "",
         dry_run: bool = False,
@@ -684,16 +684,18 @@ class CR5AFGripperEnv:
             return {"executed_action": action.astype(np.float64), "action_type": "policy"}
 
         # ── HIL: spacemouse can override the policy (human takeover) ────────
-        # When the human pushes the spacemouse (translation above deadzone) or
-        # presses a gripper button, override the policy's target. The human's
-        # target is recorded as executed_action so the replay buffer stores HIL
-        # transitions (action_type="human") for bootstrapping.
+        # Matches record_demo_gripper.py (line 958-967):
+        #   tdelta = [tx, ty, -tz] * action_scale   (tz NEGATED)
+        #   deadzone on max|translation| (recorder dead_zone)
+        # Rate-mode here (target = cur + delta) vs the recorder's integrated
+        # p_nom — equivalent feel when the per-step clamp doesn't limit.
         action_type = "policy"
         if self._spacemouse is not None:
             sm_axes, sm_btns = self._spacemouse.read()
-            if np.linalg.norm(sm_axes[:3]) > 0.15:  # human pushing -> override xyz
-                # target = current + human delta (the 50 mm/s clamp below caps it)
-                action[0:3] = cur_pos[:3] + sm_axes[:3] * (self._sm_lin_scale * self._dt)
+            if np.max(np.abs(sm_axes[:3])) > 0.1:  # deadzone (recorder: 0.3)
+                # [tx, ty, -tz] — tz negated to match the recorder's base-frame mapping
+                sm_delta = np.array([sm_axes[0], sm_axes[1], -sm_axes[2]], dtype=np.float64)
+                action[0:3] = cur_pos[:3] + sm_delta * self._sm_lin_scale
                 action_type = "human"
             if sm_btns[0]:        # BTN_0 -> close
                 action[GRIPPER_IDX] = 0.0
@@ -701,6 +703,9 @@ class CR5AFGripperEnv:
             elif sm_btns[1]:      # BTN_1 -> open
                 action[GRIPPER_IDX] = 1.0
                 action_type = "human"
+            if action_type == "human":
+                logger.info("[HIL] takeover: trans=%s btns=%s",
+                            np.round(sm_axes[:3], 2).tolist(), sm_btns)
 
         # ServoP takes an ABSOLUTE Cartesian target pose (mm, deg), NOT a
         # velocity. (Confirmed on hardware: feeding velocities makes the robot
@@ -709,10 +714,12 @@ class CR5AFGripperEnv:
         targ_eef = action[EEF9D_SLICE]
         dt = self._dt  # step period in seconds (1/control_hz)
 
-        # ── translation: clamp per-step delta (50 mm/s cap at the control period)
+        # ── translation: clamp per-step delta. Policy: 50 mm/s (safety).
+        # HIL (human): 200 mm/s so teleop isn't sluggish (matches recorder feel).
         cur_xyz_mm = cur_pos[:3] * M_TO_MM
         targ_xyz_mm = targ_eef[:3] * M_TO_MM
-        pos_delta_mm = np.clip(targ_xyz_mm - cur_xyz_mm, -50.0 * dt, 50.0 * dt)
+        max_mms = 200.0 if action_type == "human" else 50.0
+        pos_delta_mm = np.clip(targ_xyz_mm - cur_xyz_mm, -max_mms * dt, max_mms * dt)
         target_xyz_mm = cur_xyz_mm + pos_delta_mm
 
         # ── orientation target (deg, native tool axis-angle) ─────────────────

@@ -194,6 +194,16 @@ class CR5AFGripperEnv:
                 logger.warning("[SPACEMOUSE] unavailable (%s) — HIL disabled, policy only", e)
                 self._spacemouse = None
 
+        # Background 30 Hz ServoP streamer — keeps servo mode engaged between the
+        # 8 Hz policy steps. At 8 Hz alone the controller drops servo + re-solves
+        # IK each step -> jitter. step() sets _servop_target; this thread streams
+        # it at 30 Hz. Idle (None) until the first step sets a target.
+        self._servop_target = None
+        self._servop_thread = None
+        if not self._dry_run:
+            self._servop_thread = threading.Thread(target=self._servop_loop, daemon=True)
+            self._servop_thread.start()
+
         # ── cameras (RealSense) ────────────────────────────────────────────
         self._cam_hand = None
         self._cam_table = None
@@ -457,6 +467,19 @@ class CR5AFGripperEnv:
                 self._cmd_sock.sendall(cmd.encode("utf-8"))
             except Exception as e:
                 logger.warning("servop error: %s", e)
+
+    def _servop_loop(self):
+        """Background 30 Hz ServoP streamer. Keeps servo mode engaged between the
+        8 Hz policy steps — otherwise the controller drops servo + re-solves IK
+        each step (jitter). step() sets _servop_target; this thread streams it."""
+        period = 1.0 / 30.0
+        while self._running:
+            t = self._servop_target
+            if t is not None:
+                xyz_mm, rot_deg = t
+                self._servop(xyz_mm[0], xyz_mm[1], xyz_mm[2],
+                             rot_deg[0], rot_deg[1], rot_deg[2])
+            time.sleep(period)
 
     def _runscript(self, project: str):
         """Trigger a DobotStudio project via RunScript.
@@ -782,8 +805,11 @@ class CR5AFGripperEnv:
         if self._joint_space:
             self._servo_joint(target_xyz_mm, target_rot_deg, cur_q_deg, dt)
         else:
-            self._servop(target_xyz_mm[0], target_xyz_mm[1], target_xyz_mm[2],
-                         target_rot_deg[0], target_rot_deg[1], target_rot_deg[2])
+            # Hand the target to the 30 Hz background ServoP streamer. Streaming
+            # at a tight cadence keeps servo mode engaged between the 8 Hz policy
+            # steps; at 8 Hz alone the controller drops servo, re-solves IK each
+            # step, and the arm jitters (the _servop docstring notes this).
+            self._servop_target = (target_xyz_mm.copy(), target_rot_deg.copy())
 
         # gripper
         grip_target = float(action[GRIPPER_IDX])

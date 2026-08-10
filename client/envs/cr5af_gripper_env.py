@@ -690,12 +690,14 @@ class CR5AFGripperEnv:
         # Rate-mode here (target = cur + delta) vs the recorder's integrated
         # p_nom — equivalent feel when the per-step clamp doesn't limit.
         action_type = "policy"
+        hil_trans = False  # only true when the human is pushing (translation override)
         if self._spacemouse is not None:
             sm_axes, sm_btns = self._spacemouse.read()
             if np.max(np.abs(sm_axes[:3])) > 0.1:  # deadzone (recorder: 0.3)
                 # [tx, ty, -tz] — tz negated to match the recorder's base-frame mapping
                 sm_delta = np.array([sm_axes[0], sm_axes[1], -sm_axes[2]], dtype=np.float64)
                 action[0:3] = cur_pos[:3] + sm_delta * self._sm_lin_scale
+                hil_trans = True
                 action_type = "human"
             if sm_btns[0]:        # BTN_0 -> close
                 action[GRIPPER_IDX] = 0.0
@@ -704,8 +706,8 @@ class CR5AFGripperEnv:
                 action[GRIPPER_IDX] = 1.0
                 action_type = "human"
             if action_type == "human":
-                logger.info("[HIL] takeover: trans=%s btns=%s",
-                            np.round(sm_axes[:3], 2).tolist(), sm_btns)
+                logger.info("[HIL] takeover: trans=%s btns=%s hil_trans=%s",
+                            np.round(sm_axes[:3], 2).tolist(), sm_btns, hil_trans)
 
         # ServoP takes an ABSOLUTE Cartesian target pose (mm, deg), NOT a
         # velocity. (Confirmed on hardware: feeding velocities makes the robot
@@ -715,10 +717,12 @@ class CR5AFGripperEnv:
         dt = self._dt  # step period in seconds (1/control_hz)
 
         # ── translation: clamp per-step delta. Policy: 50 mm/s (safety).
-        # HIL (human): 200 mm/s so teleop isn't sluggish (matches recorder feel).
+        # HIL translation (human pushing): 200 mm/s so teleop isn't sluggish.
+        # NOTE: a button-press-only HIL (hil_trans=False) keeps 50 mm/s — otherwise
+        # holding a gripper button would speed up the policy's translation -> jump.
         cur_xyz_mm = cur_pos[:3] * M_TO_MM
         targ_xyz_mm = targ_eef[:3] * M_TO_MM
-        max_mms = 200.0 if action_type == "human" else 50.0
+        max_mms = 200.0 if hil_trans else 50.0
         pos_delta_mm = np.clip(targ_xyz_mm - cur_xyz_mm, -max_mms * dt, max_mms * dt)
         target_xyz_mm = cur_xyz_mm + pos_delta_mm
 

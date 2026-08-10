@@ -240,6 +240,9 @@ class CR5AFGripperEnv:
 
     def _rt_loop(self):
         buf = bytearray()
+        magic_bytes = struct.pack("<Q", RT_FRAME_MAGIC)  # 8-byte frame sync anchor
+        _recv = _parsed = _dropped = 0
+        _last_log = time.time()
         while self._running:
             if self._rt_sock is None:
                 time.sleep(0.5)
@@ -249,11 +252,37 @@ class CR5AFGripperEnv:
                 if not chunk:
                     raise ConnectionError("RT connection closed")
                 buf.extend(chunk)
-                # parse complete 1440-byte frames
+                _recv += len(chunk)
+                # parse 1440-byte frames, SYNCED on the magic at offset
+                # RT_TEST_VALUE. TCP is a byte stream; a recv can start mid-frame
+                # and a single misaligned 1440-slice stays misaligned forever
+                # (every frame fails the magic check -> RT goes stale -> blind
+                # env). Re-sync by finding the magic before each frame.
                 while len(buf) >= 1440:
+                    idx = buf.find(magic_bytes)
+                    if idx == -1:
+                        del buf[:-7]  # keep partial magic, wait for more
+                        break
+                    frame_start = idx - RT_TEST_VALUE
+                    if frame_start < 0:
+                        del buf[:idx + 8]  # magic too early; skip (false positive)
+                        continue
+                    if len(buf) < frame_start + 1440:
+                        del buf[:frame_start]  # discard preamble, wait for full frame
+                        break
+                    if frame_start > 0:
+                        del buf[:frame_start]
+                        _dropped += frame_start
                     frame = bytes(buf[:1440])
                     del buf[:1440]
                     self._parse_rt_frame(frame)
+                    _parsed += 1
+                now = time.time()
+                if now - _last_log > 5.0:
+                    _last_log = now
+                    logger.info("[RT-STATS] recv=%d parsed=%d dropped=%d buf=%d valid=%s age=%.1fs",
+                                _recv, _parsed, _dropped, len(buf),
+                                self._rt_valid, now - (self._rt_last_ts or now))
             except Exception as e:
                 logger.warning("RT recv error: %s, reconnecting...", e)
                 try:

@@ -44,6 +44,8 @@ class EnvClient:
                     compression=None,
                     max_size=None,
                     close_timeout=100,
+                    ping_interval=None,
+                    ping_timeout=None,
                 )
                 return conn
             except _CONNECT_RETRY_EXC as e:

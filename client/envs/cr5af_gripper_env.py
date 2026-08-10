@@ -438,7 +438,9 @@ class CR5AFGripperEnv:
         """Trigger a DobotStudio project via RunScript."""
         if self._dry_run:
             return
-        self._send_cmd(f'RunScript("{project}")', read_response=False)
+        resp = self._send_cmd(f'RunScript("{project}")', read_response=True, timeout=2.0)
+        err = resp.split(",", 1)[0].strip() if resp else "(no reply)"
+        logger.info("[GRIPPER] RunScript(%s) -> ErrorID=%s", project, err)
 
     # ── joint-space control (InverseKin + ServoJ) ───────────────────────────
 

@@ -200,6 +200,11 @@ class CR5AFGripperEnv:
         # it at 30 Hz. Idle (None) until the first step sets a target.
         self._servop_target = None
         self._servop_thread = None
+        # Streamer velocity cap (mm/s) + arrival deadband (mm). The streamer
+        # tracks the goal forward-only at this speed; step()'s per-step clamp
+        # still bounds how far ahead the goal can be set.
+        self._servop_v_mm_s = 120.0
+        self._servop_deadband_mm = 0.5
         if not self._dry_run:
             self._servop_thread = threading.Thread(target=self._servop_loop, daemon=True)
             self._servop_thread.start()
@@ -469,15 +474,33 @@ class CR5AFGripperEnv:
                 logger.warning("servop error: %s", e)
 
     def _servop_loop(self):
-        """Background 30 Hz ServoP streamer. Keeps servo mode engaged between the
-        8 Hz policy steps — otherwise the controller drops servo + re-solves IK
-        each step (jitter). step() sets _servop_target; this thread streams it."""
+        """Background 30 Hz ServoP streamer, recorder-faithful forward tracking.
+
+        step() sets _servop_target (an absolute goal). Each 30 Hz cycle this
+        thread reads the LIVE measured pose and commands a point that steps
+        toward the goal by at most ``_servop_v_mm_s`` per second — i.e. always
+        AT OR AHEAD of the current pose, never behind it. This mirrors the proven
+        recorder (``target = measured_pose + delta`` every 30 Hz cycle) and kills
+        the "back before forward" limit cycle: re-sending a FIXED absolute
+        setpoint made ServoP correct backward whenever the arm overshot/drifted
+        past it. Within a deadband of the goal it holds the measured pose
+        (command = where you are), so servo stays engaged with no dither."""
         period = 1.0 / 30.0
+        v_per_cycle = self._servop_v_mm_s * period  # max mm moved per cycle
+        deadband_mm = self._servop_deadband_mm
         while self._running:
             t = self._servop_target
             if t is not None:
-                xyz_mm, rot_deg = t
-                self._servop(xyz_mm[0], xyz_mm[1], xyz_mm[2],
+                tgt_xyz_mm, rot_deg = t
+                with self._lock:
+                    cur_xyz_mm = self._pos[:3].astype(np.float64) * M_TO_MM
+                remaining = tgt_xyz_mm - cur_xyz_mm
+                if float(np.max(np.abs(remaining))) < deadband_mm:
+                    cmd_xyz = cur_xyz_mm  # arrived: hold here (no backward)
+                else:
+                    step_mm = np.clip(remaining, -v_per_cycle, v_per_cycle)
+                    cmd_xyz = cur_xyz_mm + step_mm  # forward-only toward goal
+                self._servop(cmd_xyz[0], cmd_xyz[1], cmd_xyz[2],
                              rot_deg[0], rot_deg[1], rot_deg[2])
             time.sleep(period)
 

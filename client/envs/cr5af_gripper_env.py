@@ -194,16 +194,45 @@ class CR5AFGripperEnv:
                 logger.warning("[SPACEMOUSE] unavailable (%s) — HIL disabled, policy only", e)
                 self._spacemouse = None
 
+        # ── HIL teleop state (recorder-faithful) ────────────────────────────
+        # Deadman held -> the 30 Hz streamer reads the spacemouse directly and
+        # drives target = nominal + per-cycle increment, exactly like
+        # record_demo_gripper (no 8 Hz staircase, no goal-pursuit deadband).
+        # step() only flags the takeover + gripper + bookkeeping.
+        self._hil_deadman = False
+        self._hil_nominal_mm = None       # teleoperated nominal xyz (mm); None = not in HIL
+        self._sm_hil_scale_mm = 8.0       # recorder --action-scale: mm per unit per 30 Hz cycle
+        self._sm_dead_zone = 0.15         # recorder --dead-zone: reject tremor below this
+        # Median zero-offset calibration (recorder L737-743): the device rests at
+        # a small per-axis bias; subtract it on every read so idle -> exactly 0 and
+        # pushes aren't skewed. Requires the operator NOT touch it at env create.
+        self._sm_zero = np.zeros(6, dtype=np.float64)
+        if self._spacemouse is not None:
+            samples = []
+            for _ in range(30):
+                samples.append(self._spacemouse.read()[0].astype(np.float64))
+                time.sleep(1.0 / 30.0)
+            self._sm_zero = np.median(np.asarray(samples), axis=0)
+            logger.info("[SPACEMOUSE] zero-offset (median of %d still samples) = %s",
+                        len(samples), np.round(self._sm_zero, 3).tolist())
+
         # Background 30 Hz ServoP streamer — keeps servo mode engaged between the
         # 8 Hz policy steps. At 8 Hz alone the controller drops servo + re-solves
         # IK each step -> jitter. step() sets _servop_target; this thread streams
         # it at 30 Hz. Idle (None) until the first step sets a target.
         self._servop_target = None
         self._servop_thread = None
-        # Streamer velocity cap (mm/s) + arrival deadband (mm). The streamer
-        # tracks the goal forward-only at this speed; step()'s per-step clamp
-        # still bounds how far ahead the goal can be set.
-        self._servop_v_mm_s = 120.0
+        # Gripper actuation pause: RunScript(grip_*) needs the controller IDLE
+        # (RobotMode != 7), but this streamer keeps re-sending ServoP every cycle
+        # (even at the goal, to stop dither) -> RobotMode stays RUNNING -> the
+        # gripper RunScript is rejected with -5 (busy) and the grip is lost. While
+        # a gripper op is in flight, the streamer skips ServoP so the controller
+        # goes idle and the RunScript lands. (record_demo_gripper gets this for
+        # free: its delta-threshold skips ServoP when the arm is still.)
+        self._gripper_busy = False
+        # Streamer arrival deadband (mm). Within it, the streamer holds the goal
+        # (fixed) so a vibrating end-effector can't dither the command. Pursuit
+        # speed is per-target (max_mms from step()), carried in _servop_target.
         self._servop_deadband_mm = 0.5
         if not self._dry_run:
             self._servop_thread = threading.Thread(target=self._servop_loop, daemon=True)
@@ -474,32 +503,114 @@ class CR5AFGripperEnv:
                 logger.warning("servop error: %s", e)
 
     def _servop_loop(self):
-        """Background 30 Hz ServoP streamer, recorder-faithful forward tracking.
+        """Background 30 Hz ServoP streamer — recorder-faithful pursuit.
 
-        step() sets _servop_target (an absolute goal). Each 30 Hz cycle this
-        thread reads the LIVE measured pose and commands a point that steps
-        toward the goal by at most ``_servop_v_mm_s`` per second — i.e. always
-        AT OR AHEAD of the current pose, never behind it. This mirrors the proven
-        recorder (``target = measured_pose + delta`` every 30 Hz cycle) and kills
-        the "back before forward" limit cycle: re-sending a FIXED absolute
-        setpoint made ServoP correct backward whenever the arm overshot/drifted
-        past it. Within a deadband of the goal it holds the measured pose
-        (command = where you are), so servo stays engaged with no dither."""
+        The proven teleop recorder (record_demo_gripper.py) is smooth because,
+        every 30 Hz cycle, it commands ``target = measured_pose + this_cycle's
+        increment`` at the *intended* speed, and sends NOTHING when idle. Its
+        target is therefore always exactly one increment ahead of where the arm
+        IS — impossible to overshoot, no dither at rest.
+
+        Our earlier streamer broke both: it chased an ABSOLUTE 8 Hz goal at a
+        fixed 120 mm/s. The policy caps motion at 50 mm/s (~6 mm/step), so the
+        streamer rushed the arm past the goal in ~1.5 cycles, overshot on
+        inertia, then corrected backward — a back-twitch every step ("先往左再
+        往右"). At rest it re-commanded ``measured + step`` each cycle, feeding
+        the long end-effector's vibration back in (the moment-arm wobble).
+
+        Fix (recorder-faithful):
+          * Pursue at the SAME speed step() used to clamp the goal (``v_mm_s``,
+            carried in the target tuple) so the ramp lands on the goal exactly
+            as the next 8 Hz goal arrives — constant velocity, never rushing,
+            never overshooting.
+          * Within the arrival deadband, command the FIXED goal (not the live
+            measured pose) so a vibrating arm can't dither the command.
+        """
         period = 1.0 / 30.0
-        v_per_cycle = self._servop_v_mm_s * period  # max mm moved per cycle
         deadband_mm = self._servop_deadband_mm
+        _diag_last = 0.0          # [SERVO-DIAG] throttle
+        _diag_prev_rem = None     # previous remaining vector (overshoot detect)
         while self._running:
+            # A gripper RunScript is in flight — stop servo-ing so the controller
+            # goes idle (RobotMode != 7) and the RunScript isn't rejected with -5.
+            if self._gripper_busy:
+                time.sleep(period)
+                continue
+            # ── HIL: deadman sensed + teleop driven HERE at 30 Hz ────────────
+            # Sensing the deadman (and capturing the nominal) in this 30 Hz loop
+            # rather than the ~5 Hz step() cuts takeover latency to ~1 cycle. If it
+            # were sensed in step(), the policy kept driving for a full inference
+            # period after the grab and the arm lurched to the pending policy goal
+            # first (the "jump on takeover"). Teleop then mirrors record_demo_gripper
+            # exactly: target = nominal + per-cycle increment, no goal-pursuit, no
+            # deadband-hold -> no staircase jitter.
+            if self._spacemouse is not None:
+                axes, btns = self._read_sm_axes()
+                dead = bool(btns[1])
+                if dead and not self._hil_deadman:          # rising edge: snap nominal
+                    with self._lock:
+                        self._hil_nominal_mm = self._pos[:3].astype(np.float64) * M_TO_MM
+                        if self._held_rot_deg is None:
+                            self._held_rot_deg = self._tcp_rxyz_deg.copy()
+                    self._hil_deadman = True
+                    logger.info("[HIL] deadman ENGAGED (30Hz streamer) from %s",
+                                np.round(self._hil_nominal_mm, 1).tolist())
+                elif (not dead) and self._hil_deadman:      # falling edge: hold + resume
+                    with self._lock:
+                        hold_mm = self._pos[:3].astype(np.float64) * M_TO_MM
+                        hold_rot = (self._held_rot_deg.copy() if self._held_rot_deg is not None
+                                    else self._tcp_rxyz_deg.copy())
+                        self._hil_nominal_mm = None
+                    # Hold current pose so policy resume doesn't snap to a stale target.
+                    self._servop_target = (hold_mm, hold_rot, 50.0)
+                    self._hil_deadman = False
+                    logger.info("[HIL] deadman RELEASED (30Hz streamer) — holding, policy resumes")
+
+                if self._hil_deadman and self._hil_nominal_mm is not None:
+                    if float(np.max(np.abs(axes[:3]))) > self._sm_dead_zone:
+                        d = np.array([axes[0], axes[1], -axes[2]], dtype=np.float64) * self._sm_hil_scale_mm
+                        with self._lock:
+                            if self._hil_nominal_mm is not None:
+                                self._hil_nominal_mm = np.clip(
+                                    self._hil_nominal_mm + d, WORKSPACE_MIN_MM, WORKSPACE_MAX_MM)
+                    with self._lock:
+                        nom = None if self._hil_nominal_mm is None else self._hil_nominal_mm.copy()
+                    if nom is not None and self._held_rot_deg is not None:
+                        rot = self._held_rot_deg
+                        self._servop(nom[0], nom[1], nom[2], rot[0], rot[1], rot[2])
+                    time.sleep(period)
+                    continue
             t = self._servop_target
             if t is not None:
-                tgt_xyz_mm, rot_deg = t
+                tgt_xyz_mm, rot_deg, v_mm_s = t
+                v_per_cycle = v_mm_s * period  # max mm/cycle = intended speed
                 with self._lock:
                     cur_xyz_mm = self._pos[:3].astype(np.float64) * M_TO_MM
                 remaining = tgt_xyz_mm - cur_xyz_mm
                 if float(np.max(np.abs(remaining))) < deadband_mm:
-                    cmd_xyz = cur_xyz_mm  # arrived: hold here (no backward)
+                    cmd_xyz = tgt_xyz_mm  # arrived: hold the GOAL (fixed, no dither)
                 else:
                     step_mm = np.clip(remaining, -v_per_cycle, v_per_cycle)
-                    cmd_xyz = cur_xyz_mm + step_mm  # forward-only toward goal
+                    cmd_xyz = cur_xyz_mm + step_mm  # ramp toward goal at intended speed
+                # ── [SERVO-DIAG] behavior-neutral confirmation: with the fix,
+                # OVERSHOOT flips should be absent (the arm no longer rushes
+                # past the goal). Remove after the run confirms smoothness.
+                _now = time.time()
+                if _now - _diag_last > 0.15:
+                    _diag_last = _now
+                    flip = ""
+                    if _diag_prev_rem is not None:
+                        sign_flip = (np.sign(remaining) * np.sign(_diag_prev_rem) < 0)
+                        moving = np.abs(remaining) > deadband_mm
+                        if np.any(sign_flip & moving):
+                            ax = "".join("xyz"[k] for k in np.where(sign_flip & moving)[0])
+                            flip = f" OVERSHOOT[{ax}]"
+                    _diag_prev_rem = remaining.copy()
+                    logger.info("[SERVO-DIAG] goal=%s meas=%s rem=%s cmd=%s v=%.0f%s",
+                                np.round(tgt_xyz_mm, 1).tolist(),
+                                np.round(cur_xyz_mm, 1).tolist(),
+                                np.round(remaining, 2).tolist(),
+                                np.round(cmd_xyz, 1).tolist(), v_mm_s, flip)
                 self._servop(cmd_xyz[0], cmd_xyz[1], cmd_xyz[2],
                              rot_deg[0], rot_deg[1], rot_deg[2])
             time.sleep(period)
@@ -628,22 +739,34 @@ class CR5AFGripperEnv:
         REQUIRED before grip_open/grip_close actuate — the DHGrip plugin must be
         initialized. Mirrors record_demo_gripper's gripper.initialize()
         (RunScript(grip_init) -> DHGripInit)."""
-        self._wait_idle()
-        self._runscript("grip_init")
-        self._wait_idle()
+        self._gripper_busy = True
+        try:
+            self._wait_idle()
+            self._runscript("grip_init")
+            self._wait_idle()
+        finally:
+            self._gripper_busy = False
         logger.info("[GRIPPER] initialized (grip_init / DHGripInit done)")
 
     def _gripper_open(self):
-        self._wait_idle()
-        self._runscript("grip_open")
-        self._wait_idle()
-        self._gripper_pos = 1.0
+        self._gripper_busy = True  # pause the ServoP streamer so RobotMode goes idle
+        try:
+            self._wait_idle()
+            self._runscript("grip_open")
+            self._wait_idle()
+            self._gripper_pos = 1.0
+        finally:
+            self._gripper_busy = False
 
     def _gripper_close(self):
-        self._wait_idle()
-        self._runscript("grip_close")
-        self._wait_idle()
-        self._gripper_pos = 0.0
+        self._gripper_busy = True  # pause the ServoP streamer so RobotMode goes idle
+        try:
+            self._wait_idle()
+            self._runscript("grip_close")
+            self._wait_idle()
+            self._gripper_pos = 0.0
+        finally:
+            self._gripper_busy = False
 
     # ═══════════════════════════════════════════════════════════════════════
     # Observations
@@ -715,6 +838,12 @@ class CR5AFGripperEnv:
         time.sleep(0.5)
         return self.get_observation()
 
+    def _read_sm_axes(self):
+        """Spacemouse (axes6, buttons) with the calibrated zero-offset removed
+        (recorder L821: ``action[:6] -= zero_offset``)."""
+        axes, btns = self._spacemouse.read()
+        return axes.astype(np.float64) - self._sm_zero, btns
+
     def step(self, action: np.ndarray) -> Dict[str, Any]:
         action = np.asarray(action, dtype=np.float64).ravel()
         assert action.shape == (16,), f"action must be (16,), got {action.shape}"
@@ -746,29 +875,29 @@ class CR5AFGripperEnv:
         # BTN_0 (left) = gripper toggle (rising edge flips open/close).
         # Translation: [tx, ty, -tz]*scale (tz negated, recorder line 965).
         action_type = "policy"
-        hil_trans = False
         if self._spacemouse is not None:
-            sm_axes, sm_btns = self._spacemouse.read()
-            btn0, btn1 = bool(sm_btns[0]), bool(sm_btns[1])
-            # BTN_0 rising edge -> toggle HIL gripper
+            _, sm_btns = self._read_sm_axes()
+            btn0 = bool(sm_btns[0])
+            # BTN_0 rising edge -> toggle HIL gripper (slow RunScript; 8 Hz is fine)
             if btn0 and not self._prev_btn0:
                 self._hil_grip = 0.0 if self._hil_grip >= 0.5 else 1.0
                 logger.info("[HIL] gripper toggle -> %s",
                             "open" if self._hil_grip >= 0.5 else "close")
             self._prev_btn0 = btn0
-            # BTN_1 = deadman
-            if btn1:
+            # BTN_1 = deadman. It is sensed AND handled entirely in the 30 Hz
+            # streamer (nominal capture, teleop increment, release hold) so takeover
+            # latency is ~1 cycle, not a full inference period. If it were sensed
+            # here (this loop runs at the ~5 Hz inference rate) the policy would keep
+            # driving 0.2-0.5 s after the grab -> the arm lurches to the pending
+            # policy goal before HIL engages (the "jump on takeover"). step() only
+            # MIRRORS the streamer's flag into the action/buffer + gripper.
+            if self._hil_deadman:
                 action_type = "human"
                 action[GRIPPER_IDX] = self._hil_grip
-                if np.max(np.abs(sm_axes[:3])) > 0.1:  # pushing -> override xyz
-                    sm_delta = np.array([sm_axes[0], sm_axes[1], -sm_axes[2]], dtype=np.float64)
-                    action[0:3] = cur_pos[:3] + sm_delta * self._sm_lin_scale
-                    hil_trans = True
-                else:
-                    action[0:3] = cur_pos[:3]  # deadman held, not pushing -> hold
-                logger.info("[HIL] deadman: trans=%s hil_trans=%s grip=%s",
-                            np.round(sm_axes[:3], 2).tolist(), hil_trans,
-                            "open" if self._hil_grip >= 0.5 else "close")
+                with self._lock:
+                    nom = None if self._hil_nominal_mm is None else self._hil_nominal_mm.copy()
+                if nom is not None:  # executed action = teleop nominal (meters)
+                    action[0:3] = nom * MM_TO_M
 
         # ServoP takes an ABSOLUTE Cartesian target pose (mm, deg), NOT a
         # velocity. (Confirmed on hardware: feeding velocities makes the robot
@@ -777,13 +906,12 @@ class CR5AFGripperEnv:
         targ_eef = action[EEF9D_SLICE]
         dt = self._dt  # step period in seconds (1/control_hz)
 
-        # ── translation: clamp per-step delta. Policy: 50 mm/s (safety).
-        # HIL translation (human pushing): 200 mm/s so teleop isn't sluggish.
-        # NOTE: a button-press-only HIL (hil_trans=False) keeps 50 mm/s — otherwise
-        # holding a gripper button would speed up the policy's translation -> jump.
+        # ── translation: clamp per-step delta to the policy cap (50 mm/s).
+        # HIL motion does NOT pass through here — it is driven directly by the
+        # 30 Hz streamer (recorder-faithful); this path is policy-only.
         cur_xyz_mm = cur_pos[:3] * M_TO_MM
         targ_xyz_mm = targ_eef[:3] * M_TO_MM
-        max_mms = 200.0 if hil_trans else 50.0
+        max_mms = 50.0  # policy translation cap (mm/s); HIL motion bypasses this path
         pos_delta_mm = np.clip(targ_xyz_mm - cur_xyz_mm, -max_mms * dt, max_mms * dt)
         target_xyz_mm = cur_xyz_mm + pos_delta_mm
         # Workspace safety: never let the target leave the proven box.
@@ -825,14 +953,22 @@ class CR5AFGripperEnv:
             target_rot_deg = R.from_matrix(R_delta @ R_cur).as_rotvec(degrees=True)
 
         # ── dispatch: joint-space (IK + ServoJ) or Cartesian (ServoP) ────────
-        if self._joint_space:
-            self._servo_joint(target_xyz_mm, target_rot_deg, cur_q_deg, dt)
-        else:
-            # Hand the target to the 30 Hz background ServoP streamer. Streaming
-            # at a tight cadence keeps servo mode engaged between the 8 Hz policy
-            # steps; at 8 Hz alone the controller drops servo, re-solves IK each
-            # step, and the arm jitters (the _servop docstring notes this).
-            self._servop_target = (target_xyz_mm.copy(), target_rot_deg.copy())
+        # Skipped during HIL (the 30 Hz streamer drives the arm directly) and for
+        # the empty-plan zeros sentinel (targ_eef xyz==0 -> would drive toward the
+        # origin, outside the workspace). Both cases must NOT push a servo target.
+        zeros_sentinel = bool(np.allclose(targ_eef[:3], 0.0))
+        if action_type != "human" and not zeros_sentinel:
+            if self._joint_space:
+                self._servo_joint(target_xyz_mm, target_rot_deg, cur_q_deg, dt)
+            else:
+                # Hand the target to the 30 Hz background ServoP streamer. Streaming
+                # at a tight cadence keeps servo mode engaged between the 8 Hz policy
+                # steps; at 8 Hz alone the controller drops servo, re-solves IK each
+                # step, and the arm jitters (the _servop docstring notes this).
+                # Carry max_mms so the streamer pursues at the SAME speed step()
+                # clamped the goal to — the ramp lands on the goal exactly as the
+                # next 8 Hz goal arrives, so the arm never rushes ahead and overshoots.
+                self._servop_target = (target_xyz_mm.copy(), target_rot_deg.copy(), float(max_mms))
 
         # gripper
         grip_target = float(action[GRIPPER_IDX])

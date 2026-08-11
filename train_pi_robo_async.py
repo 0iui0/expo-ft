@@ -61,6 +61,18 @@ flags.DEFINE_integer("client_port", 8102, "Port for environment operations serve
 
 flags.DEFINE_integer("replan_steps", 8, "Number of replan steps for evaluation.")
 
+# Chunk-boundary blend (#4): the VLA infers a 16-step chunk but we execute only
+# replan_steps (8) then re-infer. The new chunk's first waypoints are absolute
+# targets planned from a lagging observation, so they pull BACKWARD toward the
+# arm's current pose -> a visible "退一步" every replan (~1s). Fix: temporally
+# ensemble the seam. sample_actions (only_base_actions) returns the FULL 16-step
+# chunk; we keep the discarded tail a[replan:] and blend it into the next chunk's
+# first blend_steps waypoints (aligned b0<->a8), tapering the weight to 0. This
+# uses already-computed actions (no extra inference) and cancels the reversal.
+# Only xyz (dims 0:3) is blended; rot6d/gripper pass through. blend_w0=0 disables.
+flags.DEFINE_integer("boundary_blend_steps", 4, "Chunk-seam blend length (# waypoints tapered).")
+flags.DEFINE_float("boundary_blend_w0", 0.6, "Chunk-seam blend initial weight on prev-chunk tail (0=off).")
+
 # Rollout uses only the base VLA action (1 sample, no OTF Q-select, no residual
 # edit). The OTF critic + residual actor are random at startup (no offline
 # warm-start), so argmax-Q over N candidates + a random residual corrupts the
@@ -265,6 +277,9 @@ def main(_):
     env.step(FLAGS.config_task.example_action.squeeze().tolist())
     action_plan = deque()
     action_type = "policy"
+    # Tail (a[replan_steps:]) of the last VLA chunk, kept for the boundary blend.
+    # None = no valid predecessor (first chunk, or after human/reset): blend skipped.
+    prev_tail = None
     combine_rng = jax.random.PRNGKey(FLAGS.seed + 100)
 
     # --- Async update thread setup ---
@@ -396,7 +411,18 @@ def main(_):
                              bool(np.isfinite(_a).all()))
             episode_log.sample_info_history.append(new_si)
             training_log.record_sample_time(time.time() - sample_start, step_metrics)
-            action_plan.extend(action_chunk[:FLAGS.replan_steps])
+            # Chunk-seam blend: cancel the "退一步" reversal by ensembling the new
+            # chunk's first waypoints with the discarded tail of the previous chunk
+            # (which continues forward). b_k aligns with prev_tail[k] (=a_{replan+k}).
+            chunk = np.asarray(action_chunk, dtype=np.float64)  # (action_horizon, action_dim)
+            exec_chunk = chunk[:FLAGS.replan_steps].copy()
+            if prev_tail is not None and FLAGS.boundary_blend_w0 > 0.0:
+                n = min(FLAGS.boundary_blend_steps, len(prev_tail), len(exec_chunk))
+                for k in range(n):
+                    w = FLAGS.boundary_blend_w0 * (1.0 - k / FLAGS.boundary_blend_steps)
+                    exec_chunk[k, 0:3] = (1.0 - w) * exec_chunk[k, 0:3] + w * prev_tail[k, 0:3]
+            prev_tail = chunk[FLAGS.replan_steps:].copy()  # a[replan:] for next seam
+            action_plan.extend(exec_chunk)
         else:
             episode_log.sample_info_history.append(episode_log.sample_info_history[-1] if episode_log.sample_info_history else None)
 
@@ -413,6 +439,7 @@ def main(_):
 
         if action_type == "human":
             action_plan.clear()
+            prev_tail = None  # human moved the arm; last chunk's tail is stale
 
         if has_action or action_type == "human":
             transition_dict = dict(
@@ -441,6 +468,7 @@ def main(_):
             done = False
             action_type = "policy"
             action_plan.clear()
+            prev_tail = None  # new episode; no predecessor chunk to blend
 
             # don't wait 10 episode to start updating as compiling is slow
             if not _can_update.is_set() and replay_buffer._size >= FLAGS.batch_size:

@@ -293,6 +293,12 @@ def main(_):
     _actor_agent.actor.replicated_sharding = sample_sharding
     _published = [None]
     _publish_lock = threading.Lock()
+    # Serializes the update thread's donating update() against the sampler's
+    # cache_infer_params() copy. update() donates the published agent's buffers
+    # (donate_argnums=0, the OOM fix); the sampler device_puts those same buffers
+    # GPU1->GPU0. Without exclusion the donation deletes a buffer mid-copy ->
+    # "Array has been deleted int32[]" (actor_train_state.step) -> segfault.
+    _swap_lock = threading.Lock()
     _buffer_lock = threading.Lock()
     _stop_event = threading.Event()
     _can_update = threading.Event()
@@ -340,9 +346,14 @@ def main(_):
                 learner_agent = learner_agent.replace(
                     rng=jax.device_put(learner_agent.rng, replicated_sharding)
                 )
-                learner_agent, update_info = learner_agent.update(
-                    learner_agent, batch, FLAGS.utd_ratio, actor_batch
-                )
+                # Hold _swap_lock across update(): it donates learner_agent's
+                # buffers (donate_argnums=0), which are the ones the sampler
+                # device_puts in cache_infer_params(). update() returns after
+                # async dispatch (~ms), so this barely stalls the sampler.
+                with _swap_lock:
+                    learner_agent, update_info = learner_agent.update(
+                        learner_agent, batch, FLAGS.utd_ratio, actor_batch
+                    )
 
                 with _publish_lock:
                     _published[0] = learner_agent
@@ -409,27 +420,35 @@ def main(_):
         loop_start = time.time()
         step_metrics = {}
 
-        with _publish_lock:
-            new_agent = _published[0]
-            _published[0] = None
-        if new_agent is not None:
-            # Free the old GPU0 inference cache BEFORE building the new one. On
-            # dual-GPU, cache_infer_params device_puts the ~3.3B actor GPU1->GPU0;
-            # building it while the previous cache is still held by _actor_agent
-            # makes old + new coexist on the sampling card and OOMs. Dropping the old
-            # cache first (single-threaded here) lets jax free those GPU0 buffers
-            # before the new copy is allocated. Costs ~0.4s/transfer, once per update.
-            _actor_agent = _actor_agent.replace(_infer_cache=None)
-            # Keep the sampler on its OWN rng. The update thread donates its
-            # agent's buffers on the next update() (donate_argnums); the published
-            # agent's rng is among them (the device_put at ~L332 is a no-op on the
-            # already-replicated key, so it is NOT a defensive copy). The sampler
-            # holds rng as a live reference and uses it steps later in
-            # sample_actions (after thor round-trips), so adopting the donated rng
-            # crashes with "Array has been deleted uint32[2]". Carry our own
-            # independent, already-advanced rng across the swap instead.
-            new_agent = new_agent.replace(rng=_actor_agent.rng)
-            _actor_agent = new_agent.cache_infer_params()
+        with _swap_lock:
+            with _publish_lock:
+                new_agent = _published[0]
+                _published[0] = None
+            if new_agent is not None:
+                # Free the old GPU0 inference cache BEFORE building the new one. On
+                # dual-GPU, cache_infer_params device_puts the ~3.3B actor GPU1->GPU0;
+                # building it while the previous cache is still held by _actor_agent
+                # makes old + new coexist on the sampling card and OOMs. Dropping the old
+                # cache first (single-threaded here) lets jax free those GPU0 buffers
+                # before the new copy is allocated. Costs ~0.4s/transfer, once per update.
+                _actor_agent = _actor_agent.replace(_infer_cache=None)
+                # Keep the sampler on its OWN rng. The update thread donates its
+                # agent's buffers on the next update() (donate_argnums); the published
+                # agent's rng is among them (the device_put at ~L332 is a no-op on the
+                # already-replicated key, so it is NOT a defensive copy). The sampler
+                # holds rng as a live reference and uses it steps later in
+                # sample_actions (after thor round-trips), so adopting the donated rng
+                # crashes with "Array has been deleted uint32[2]". Carry our own
+                # independent, already-advanced rng across the swap instead.
+                new_agent = new_agent.replace(rng=_actor_agent.rng)
+                _actor_agent = new_agent.cache_infer_params()
+                # Block until the GPU0 copies are materialized before releasing
+                # _swap_lock. cache_infer_params only *dispatches* the device_puts;
+                # if we released here the update thread's next update() could donate
+                # (delete) new_agent's GPU1 buffers while the async copy is still
+                # reading them -> "Array has been deleted". _swap_lock + this barrier
+                # guarantee the source outlives the copy.
+                jax.block_until_ready(_actor_agent._infer_cache)
 
         observation = env.get_observation()
         done, success, reward, mask = env.get_info_for_step()

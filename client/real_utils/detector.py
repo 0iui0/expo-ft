@@ -232,20 +232,20 @@ def success_detector_manual():
         return "keep_going"
 
     while True:
-        choice = _readline("[manual] Enter 1 for success, 2 for reset, 3 for keep going, then ENTER:")
+        choice = _readline("[manual] s/1=success, f/2=reset, ENTER/3=keep going:")
         if not choice:
             return "keep_going"
-        choice = choice.strip()
-        if choice == "1":
+        choice = choice.strip().lower()
+        if choice in ("s", "1"):
             print("[manual] Success annotated.")
             return "success"
-        if choice == "2":
+        if choice in ("f", "2"):
             print("[manual] Doing reset.")
             return "reset"
-        if choice == "3":
+        if choice in ("", "3"):
             print("[manual] Keep going.")
             return "keep_going"
-        print("[manual] Invalid input. Please type 1 (success), 2 (reset), or 3 (keep going), then ENTER:")
+        print("[manual] Invalid input. Please type s/1 (success), f/2 (reset), or ENTER/3 (keep going):")
 
 
 def _zed_frame_bgr_depth_intr(zed, image_mat, depth_mat):

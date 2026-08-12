@@ -10,6 +10,7 @@ import logging
 os.environ.setdefault("XLA_FLAGS", "--xla_gpu_autotune_level=0")
 import time
 import threading
+import csv
 from collections import deque
 
 import numpy as np
@@ -28,6 +29,7 @@ from expo_ft.data.batch_processor import BatchProcessor
 from expo_ft.env.env_client import EnvClientWrapper
 from expo_ft.env.droid_utils import process_droid_dataset, process_cr5af_npz_pi05
 from expo_ft.utils.log_utils import EpisodeState, TrainingStats
+from expo_ft.utils.visualization import capture_step_data, log_episode_visualizations
 from expo_ft.utils.train_utils import get_batch_info, init_logging, init_wandb
 
 import openpi.training.sharding as openpi_sharding
@@ -280,6 +282,7 @@ def main(_):
     # Tail (a[replan_steps:]) of the last VLA chunk, kept for the boundary blend.
     # None = no valid predecessor (first chunk, or after human/reset): blend skipped.
     prev_tail = None
+    last_q = None  # scalar critic Q of the last sampled action (for thor preview overlay)
     combine_rng = jax.random.PRNGKey(FLAGS.seed + 100)
 
     # --- Async update thread setup ---
@@ -291,13 +294,19 @@ def main(_):
     _published = [None]
     _publish_lock = threading.Lock()
     _buffer_lock = threading.Lock()
-    _env_step = [start_step]
     _stop_event = threading.Event()
     _can_update = threading.Event()
     _episode_done = threading.Event()
     _update_count = [0]
     _ckpt_request = [None]  # main thread sets step number; update thread saves and clears
     _ckpt_done = threading.Event()
+    # Single wandb writer: the update thread stashes its metrics here and the
+    # main rollout thread flushes them at step=i. Two threads each calling
+    # wandb.log() with independent explicit steps races the monotonic step
+    # counter and silently drops the background thread's rows — that is why
+    # training/critic_loss never landed in wandb.
+    _log_lock = threading.Lock()
+    _pending_train_log = {}
 
     def _update_worker():
         nonlocal combine_rng
@@ -310,12 +319,14 @@ def main(_):
             try:
                 if FLAGS.ep_timeout_secs > 0 and time.time() - last_episode_time > FLAGS.ep_timeout_secs:
                     logging.info("No episode finished for %.1fs, pausing updates.", FLAGS.ep_timeout_secs)
-                    wandb.log({"training/update_paused": 1}, step=_env_step[0])
+                    with _log_lock:
+                        _pending_train_log["training/update_paused"] = 1
                     _episode_done.wait()
                     _episode_done.clear()
                     last_episode_time = time.time()
                     logging.info("Episode signal received, resuming updates.")
-                    wandb.log({"training/update_paused": 0}, step=_env_step[0])
+                    with _log_lock:
+                        _pending_train_log["training/update_paused"] = 0
 
                 if _episode_done.is_set():
                     _episode_done.clear()
@@ -343,7 +354,8 @@ def main(_):
                 log_dict["training/num_updates"] = _update_count[0]
                 if _update_count[0] % 10 == 0 and len(update_time) == update_time.maxlen:
                     log_dict["training/update_time_avg_ms"] = float(np.mean(update_time)) * 1000.0
-                wandb.log(log_dict, step=_env_step[0])
+                with _log_lock:
+                    _pending_train_log.update(log_dict)
 
                 ckpt_step = _ckpt_request[0]
                 if ckpt_step is not None:
@@ -376,12 +388,26 @@ def main(_):
         _can_update.set()
         logging.info("Resuming: replay buffer already warm, update thread starting immediately.")
 
+    # Raw per-step metrics CSV for offline analysis (Q curve etc.). Written only
+    # by this main thread — same single-writer discipline as wandb — so rows stay
+    # ordered by env step. Append mode is resume-friendly; header on empty file.
+    _metrics_csv_path = os.path.join(log_dir, "train_metrics.csv")
+    _metrics_cols = [
+        "step", "num_updates", "critic_loss", "q", "q_min", "q_max",
+        "target_q_mean", "next_q_nan_ratio", "critic_grad_norm",
+        "temperature", "entropy", "q_selected", "loop_time_ms",
+    ]
+    _metrics_csv = open(_metrics_csv_path, "a", newline="")
+    _metrics_writer = csv.DictWriter(_metrics_csv, fieldnames=_metrics_cols, extrasaction="ignore")
+    if _metrics_csv.tell() == 0:
+        _metrics_writer.writeheader()
+        _metrics_csv.flush()
+
     for i in tqdm.tqdm(
         range(start_step, FLAGS.max_steps + 1), smoothing=0.1, disable=not FLAGS.tqdm
     ):
         loop_start = time.time()
         step_metrics = {}
-        _env_step[0] = i
 
         with _publish_lock:
             new_agent = _published[0]
@@ -394,6 +420,15 @@ def main(_):
             # cache first (single-threaded here) lets jax free those GPU0 buffers
             # before the new copy is allocated. Costs ~0.4s/transfer, once per update.
             _actor_agent = _actor_agent.replace(_infer_cache=None)
+            # Keep the sampler on its OWN rng. The update thread donates its
+            # agent's buffers on the next update() (donate_argnums); the published
+            # agent's rng is among them (the device_put at ~L332 is a no-op on the
+            # already-replicated key, so it is NOT a defensive copy). The sampler
+            # holds rng as a live reference and uses it steps later in
+            # sample_actions (after thor round-trips), so adopting the donated rng
+            # crashes with "Array has been deleted uint32[2]". Carry our own
+            # independent, already-advanced rng across the swap instead.
+            new_agent = new_agent.replace(rng=_actor_agent.rng)
             _actor_agent = new_agent.cache_infer_params()
 
         observation = env.get_observation()
@@ -410,6 +445,8 @@ def main(_):
                              _a[:3].tolist(), float(_a[9]) if _a.shape[0] > 9 else None,
                              bool(np.isfinite(_a).all()))
             episode_log.sample_info_history.append(new_si)
+            episode_log.step_data_history.append(capture_step_data(new_si))
+            last_q = new_si.get("q_selected", last_q)
             training_log.record_sample_time(time.time() - sample_start, step_metrics)
             # Chunk-seam blend: cancel the "退一步" reversal by ensembling the new
             # chunk's first waypoints with the discarded tail of the previous chunk
@@ -425,6 +462,7 @@ def main(_):
             action_plan.extend(exec_chunk)
         else:
             episode_log.sample_info_history.append(episode_log.sample_info_history[-1] if episode_log.sample_info_history else None)
+            episode_log.step_data_history.append(episode_log.step_data_history[-1] if episode_log.step_data_history else {})
 
         elapsed = time.time() - start_step_time
         if elapsed < dt:
@@ -432,7 +470,7 @@ def main(_):
 
         has_action = bool(action_plan)
         action = action_plan.popleft() if has_action else np.zeros_like(example_action.squeeze())
-        real_action, action_type = env.step(action.tolist())
+        real_action, action_type = env.step(action.tolist(), q_value=last_q)
         start_step_time = time.time()
 
         episode_log.record_step(observation, len(action_plan), action_type, real_action, reward)
@@ -460,6 +498,18 @@ def main(_):
             env.reset()
 
             training_log.on_episode_done(episode_log, success, step_metrics)
+
+            # ── Online RL visualizations (Q dist, sampling, edit) ─────────
+            try:
+                vis_images = log_episode_visualizations(
+                    episode_log, success,
+                    save_dir=os.path.join(log_dir, "visualizations"),
+                )
+                for tag, path in vis_images:
+                    step_metrics[tag] = wandb.Image(path)
+            except Exception as e:
+                logging.warning("Visualization failed (non-fatal): %s", e)
+
             episode_log.reset()
             with _buffer_lock:
                 batch_processor.on_episode_start()
@@ -485,8 +535,29 @@ def main(_):
             except Exception:
                 logging.exception("Could not save agent buffer.")
 
+        with _log_lock:
+            if _pending_train_log:
+                step_metrics.update(_pending_train_log)
+                _pending_train_log.clear()
+        if last_q is not None:
+            step_metrics["training/q_selected"] = float(last_q)
         step_metrics["training/loop_time_ms"] = (time.time() - loop_start) * 1000.0
         wandb.log(step_metrics, step=i)
+
+        # Mirror the analysis-relevant scalars to CSV (coerce jax/numpy 0-d to float).
+        _row = {"step": i}
+        for _k, _v in step_metrics.items():
+            _kk = _k[len("training/"):] if _k.startswith("training/") else _k
+            if _kk not in _metrics_cols:
+                continue
+            try:
+                _arr = np.asarray(_v)
+                if _arr.ndim == 0:
+                    _row[_kk] = float(_arr)
+            except (TypeError, ValueError):
+                pass
+        _metrics_writer.writerow(_row)
+        _metrics_csv.flush()
 
     if FLAGS.checkpoint_model:
         _ckpt_done.clear()
@@ -495,6 +566,7 @@ def main(_):
     _can_update.set()
     _episode_done.set()
     _update_thread.join()
+    _metrics_csv.close()
 
     if FLAGS.checkpoint_model:
         logging.info("Waiting for checkpoint manager to finish")

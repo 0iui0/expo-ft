@@ -134,9 +134,12 @@ class EnvClient:
         observation = response["observation"]
         return observation, response["done"]
     
-    def step(self, env_id: str, action: np.ndarray) -> Tuple[np.ndarray, str]:
+    def step(self, env_id: str, action: np.ndarray, q_value=None) -> Tuple[np.ndarray, str]:
         """Step the environment. Returns (real_executed_action, action_type)."""
-        response = self._call_operation("step", {"env_id": env_id, "action": action})
+        request = {"env_id": env_id, "action": action}
+        if q_value is not None:
+            request["q_value"] = float(q_value)
+        response = self._call_operation("step", request)
         real_action = np.array(response.get("action", action))
         action_type = response.get("action_type", "policy")
         return real_action, action_type
@@ -191,16 +194,18 @@ class EnvClientWrapper:
         observation, _ = self._call("reset", lambda: self.client.reset(self.env_id))
         return observation
     
-    def step(self, action):
+    def step(self, action, q_value=None):
         """Step the environment.
-        
+
         Args:
             action: Action to take (policy output).
-            
+            q_value: Optional scalar critic Q of the taken action, forwarded to
+                the env server for the live preview overlay (not used to control).
+
         Returns:
             Tuple of (real_executed_action, action_type) where action_type is "policy" or "human".
         """
-        return self._call("step", lambda: self.client.step(self.env_id, action))
+        return self._call("step", lambda: self.client.step(self.env_id, action, q_value=q_value))
 
     def get_observation(self):
         """Get the observation of the environment."""

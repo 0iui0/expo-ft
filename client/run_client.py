@@ -125,6 +125,11 @@ async def _handle_environment_request(websocket: _server.ServerConnection):
                             )
                             sent_action = np.where(np.isfinite(sent_action), sent_action, 0.0)
                         sent_is_invalid = np.allclose(sent_action, -1.0)
+                        # Forward the learner-computed scalar Q (if any) for the
+                        # live preview overlay; env-agnostic (no-op if unsupported).
+                        q_value = request.get("q_value")
+                        if q_value is not None and hasattr(env, "set_preview_q"):
+                            env.set_preview_q(q_value)
                         # The env does HIL (spacemouse takeover) internally and
                         # returns action_type ("human"/"policy"). No override here.
                         if not sent_is_invalid:

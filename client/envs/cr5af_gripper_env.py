@@ -24,6 +24,7 @@ Start on thor::
 from __future__ import annotations
 
 import logging
+import os
 import socket
 import struct
 import threading
@@ -267,6 +268,15 @@ class CR5AFGripperEnv:
                     logger.warning("D455 table camera init failed (%s), using black frames.", e)
         except ImportError:
             logger.warning("pyrealsense2 not available — camera frames will be empty.")
+
+        # ── live preview (cameras + Q overlay), gated on CR5AF_PREVIEW ──────
+        # Draws a recorder-style window on thor (where the cameras live) with
+        # the learner-shipped scalar Q overlaid. Purely a monitor; never gates
+        # control. Failures (e.g. headless) are swallowed at draw time.
+        self._preview_enabled = os.environ.get("CR5AF_PREVIEW", "").strip() not in ("", "0", "false", "False")
+        self._preview_q = None
+        self._last_hand_frame = None
+        self._last_table_frame = None
 
         # ── episode state ──────────────────────────────────────────────────
         self._steps_since_reset = 0
@@ -550,6 +560,13 @@ class CR5AFGripperEnv:
                 if dead and not self._hil_deadman:          # rising edge: snap nominal
                     with self._lock:
                         self._hil_nominal_mm = self._pos[:3].astype(np.float64) * M_TO_MM
+                        # Sync HIL gripper intent to the ACTUAL gripper state so
+                        # grabbing control never moves the gripper. _hil_grip
+                        # defaults to open and is only changed by the left button;
+                        # without this sync, engaging deadman on a closed gripper
+                        # forces action[GRIPPER_IDX]=_hil_grip=open -> spurious open
+                        # (and the policy re-closes on release = the "open-then-close").
+                        self._hil_grip = self._gripper_pos
                         if self._held_rot_deg is None:
                             self._held_rot_deg = self._tcp_rxyz_deg.copy()
                     self._hil_deadman = True
@@ -715,10 +732,14 @@ class CR5AFGripperEnv:
         self._send_cmd("StopRobot()", read_response=False)
 
     def _robot_mode_check(self) -> int:
-        """Return RobotMode (7=RUNNING)."""
+        """Return RobotMode (7=RUNNING). The reply is 'ErrorID,{Value},RobotMode()'
+        — the mode is BRACE-WRAPPED, so int('{7}') would raise and (silently) yield
+        -1, making _wait_idle never actually wait -> gripper RunScript fires while
+        the controller is still RUNNING and is rejected with -5. Strip the braces."""
         r = self._send_cmd("RobotMode()", read_response=True, timeout=2.0)
         try:
-            return int(r.split(",")[1] if "," in r else r)
+            field = r.split(",")[1] if "," in r else r
+            return int(field.strip("{} "))
         except Exception:
             return -1
 
@@ -772,16 +793,18 @@ class CR5AFGripperEnv:
     # Observations
     # ═══════════════════════════════════════════════════════════════════════
 
-    def _read_camera(self, cam: Optional[Any]) -> np.ndarray:
+    def _read_camera(self, cam: Optional[Any]):
+        """Return (obs_frame resized to image_size, native full-res frame|None)."""
         if cam is None:
-            return np.zeros((*self._image_size, 3), dtype=np.uint8)
+            return np.zeros((*self._image_size, 3), dtype=np.uint8), None
         frames = cam.wait_for_frames()
-        img = np.asanyarray(frames.get_color_frame().get_data())
+        native = np.asanyarray(frames.get_color_frame().get_data())
         h, w = self._image_size
-        if img.shape[0] != h or img.shape[1] != w:
+        img = native
+        if native.shape[0] != h or native.shape[1] != w:
             import cv2
-            img = cv2.resize(img, (w, h))
-        return img
+            img = cv2.resize(native, (w, h))
+        return img, native
 
     def get_observation(self) -> Dict[str, Any]:
         with self._lock:
@@ -789,13 +812,55 @@ class CR5AFGripperEnv:
             joints = self._joint_pos.copy()
             grip = self._gripper_pos
 
+        hand_view, hand_native = self._read_camera(self._cam_hand)
+        table_view, table_native = self._read_camera(self._cam_table)
+        if self._preview_enabled:
+            # Cache the native full-res frame (not the 256² policy input) so the
+            # preview is crisp and large, matching record_demo.py.
+            self._last_hand_frame = hand_native if hand_native is not None else hand_view
+            self._last_table_frame = table_native if table_native is not None else table_view
+
         return {
-            "video.hand_view": self._read_camera(self._cam_hand),
-            "video.table_view": self._read_camera(self._cam_table),
+            "video.hand_view": hand_view,
+            "video.table_view": table_view,
             "state.eef_9d": eef,
             "state.joint_pos": joints,
             "state.gripper_pos": np.array([grip], dtype=np.float32),
         }
+
+    def set_preview_q(self, q_value) -> None:
+        """Store the learner-shipped scalar Q for the next preview draw."""
+        try:
+            self._preview_q = float(q_value)
+        except (TypeError, ValueError):
+            self._preview_q = None
+
+    def _draw_preview(self, action_type: str) -> None:
+        """Recorder-style window: table|hand cameras + Q/grip overlay (thor)."""
+        if not self._preview_enabled:
+            return
+        table = self._last_table_frame
+        hand = self._last_hand_frame
+        if table is None or hand is None:
+            return
+        try:
+            import cv2
+            cam_h = 360
+            def _rz(f):
+                # env streams rgb8 -> convert to BGR for cv2's native color order
+                f = cv2.cvtColor(f, cv2.COLOR_RGB2BGR)
+                w = int(round(cam_h * f.shape[1] / max(f.shape[0], 1)))
+                return cv2.resize(f, (w, cam_h))
+            cam_row = np.hstack([_rz(table), _rz(hand)])
+            q_txt = f"{self._preview_q:.3f}" if self._preview_q is not None else "n/a"
+            grip = "CLOSE" if self._gripper_pos < 0.5 else "OPEN"
+            label = f"Q={q_txt} grip={grip} {action_type}"
+            cv2.putText(cam_row, label, (10, 30), cv2.FONT_HERSHEY_SIMPLEX,
+                        0.8, (0, 255, 0), 2)
+            cv2.imshow("cr5af RL preview | Q overlay", cam_row)
+            cv2.waitKey(1)
+        except Exception as e:
+            logger.debug("preview draw failed (non-fatal): %s", e)
 
     # ═══════════════════════════════════════════════════════════════════════
     # Env protocol (run_client.py interface)
@@ -979,6 +1044,7 @@ class CR5AFGripperEnv:
             self._gripper_open()
 
         self._steps_since_reset += 1
+        self._draw_preview(action_type)
         return {"executed_action": action.astype(np.float64), "action_type": action_type}
 
     def get_info_for_step(self) -> Tuple[bool, bool, float, float]:
@@ -1013,4 +1079,10 @@ class CR5AFGripperEnv:
                     cam.stop()
                 except Exception:
                     pass
+        if self._preview_enabled:
+            try:
+                import cv2
+                cv2.destroyAllWindows()
+            except Exception:
+                pass
         logger.info("CR5AF gripper env closed.")

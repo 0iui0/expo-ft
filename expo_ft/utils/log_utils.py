@@ -16,6 +16,7 @@ class EpisodeState:
     human_controlled: list = field(default_factory=list)
     human_actions: list = field(default_factory=list)
     sample_info_history: list = field(default_factory=list)
+    step_data_history: list = field(default_factory=list)
     policy_steps: int = 0
     human_steps: int = 0
     had_intervention: bool = False
@@ -28,6 +29,7 @@ class EpisodeState:
         self.human_controlled.clear()
         self.human_actions.clear()
         self.sample_info_history.clear()
+        self.step_data_history.clear()
         self.policy_steps = 0
         self.human_steps = 0
         self.had_intervention = False

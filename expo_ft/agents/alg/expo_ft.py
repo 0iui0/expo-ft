@@ -572,6 +572,34 @@ class EXPOLearner(AgentLearner, struct.PyTreeNode):
         if only_base_actions:
             action = raw_actions[0].reshape(self.action_horizon, self.action_dim)
             sample_info = {"sample_time": sample_time, "selected_action_type": "main"}
+            # Read-only critic eval of the N base candidates so the Q of the
+            # taken action (raw_actions[0]) can be visualized / overlaid. Does
+            # NOT change which action is executed (still raw_actions[0]).
+            if self.N > 1:
+                base_candidates = transformed_actions[:, :self.replan_steps, :].reshape(self.N, self.full_action_dim)
+                critic_transformed_obs = transformed_inputs["critic_obs"]
+                base_states = transformed_inputs["critic_states"]
+                if self.freeze_encoder:
+                    critic_transformed_obs = critic_transformed_obs.repeat(self.N, axis=0)
+                    base_states = base_states.repeat(self.N, axis=0)
+                base_encoded_obs = batch_encode(
+                    self.batch_encoder.apply_fn, _batch_encoder_params,
+                    critic_transformed_obs[:1], stop_gradient=True)
+                base_encoded_obs = base_encoded_obs.repeat(self.N, axis=0)
+                key, rng = jax.random.split(rng)
+                base_target_params = subsample_image_ensemble(
+                    key, _target_critic_params, self.num_min_qs, self.num_qs)
+                base_qs = compute_q(
+                    self.target_critic.apply_fn, base_target_params,
+                    base_encoded_obs, base_candidates, base_states, self.num_min_qs)
+                base_qs = np.asarray(base_qs)
+                sample_info.update({
+                    "qs": base_qs,
+                    "all_chunks": np.asarray(raw_actions),
+                    "selected_idx": 0,
+                    "n_edit": 0,
+                    "q_selected": float(base_qs[0]),
+                })
             return jnp.array(action), self.replace(rng=rng), sample_info
 
         transformed_full = transformed_actions  # (N, action_horizon, action_dim)
@@ -621,10 +649,23 @@ class EXPOLearner(AgentLearner, struct.PyTreeNode):
         else:
             action = raw_actions[0]
             idx = 0
+            qs = None
 
         action = action.reshape(self.action_horizon, self.action_dim)
         rng, _ = jax.random.split(rng, 2)
         sample_info = {"sample_time": sample_time}
+        # Surface the Q data for online-RL viz / preview overlay (see
+        # capture_step_data). all_chunks[N:] are the residual-edited candidates.
+        if qs is not None:
+            qs_np = np.asarray(qs)
+            idx_i = int(idx)
+            sample_info.update({
+                "qs": qs_np,
+                "all_chunks": np.asarray(raw_actions),
+                "selected_idx": idx_i,
+                "n_edit": int(self.n_edit_samples),
+                "q_selected": float(qs_np[idx_i]),
+            })
         return jnp.array(action), self.replace(rng=rng), sample_info
 
     def sample_batch_actions(self, batch):

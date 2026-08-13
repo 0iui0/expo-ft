@@ -238,6 +238,7 @@ class EXPOLearner(AgentLearner, struct.PyTreeNode):
     freeze_encoder: Optional[bool] = struct.field(pytree_node=False)
     freeze_critic_encoder: bool = struct.field(pytree_node=False)
     actor_success_only: bool = struct.field(pytree_node=False)
+    freeze_base_actor: bool = struct.field(pytree_node=False)
     _infer_cache: Optional[dict] = struct.field(pytree_node=False, default=None)
 
     @classmethod
@@ -296,6 +297,7 @@ class EXPOLearner(AgentLearner, struct.PyTreeNode):
         default_prompt: Optional[str] = None,
         resize_size: Optional[int] = None,
         actor_success_only: bool = False,
+        freeze_base_actor: bool = False,
         use_full_augmentation: bool = True,
         **kwargs,
     ):
@@ -485,6 +487,7 @@ class EXPOLearner(AgentLearner, struct.PyTreeNode):
             freeze_encoder=freeze_encoder,
             freeze_critic_encoder=freeze_critic_encoder,
             actor_success_only=actor_success_only,
+            freeze_base_actor=freeze_base_actor,
         )
         if not resume:
             agent = agent.cache_infer_params()
@@ -1004,17 +1007,23 @@ class EXPOLearner(AgentLearner, struct.PyTreeNode):
 
         # When actor_success_only, use the dedicated success-episode batch for
         # the Pi05 actor update; otherwise use the last critic minibatch.
-        if self.actor_success_only:
+        # freeze_base_actor skips the base-VLA BC update entirely (and, with it,
+        # the incremental target_actor_params update) so the frozen prior and its
+        # target stay pinned at SFT — the paper-faithful "frozen prior + residual"
+        # regime. Static field -> this branch resolves at trace time.
+        if self.freeze_base_actor:
+            actor_info = {}
+        elif self.actor_success_only:
             actor_batch = actor_batch.copy()
             rng, key = jax.random.split(new_agent.rng)
             actor_batch["image"] = self.data_augmentation_fn(key, actor_batch["image"])
             new_agent = new_agent.replace(rng=rng)
             actor_batch = prepare_critic_batch(actor_batch, self.actor.model_config.action_dim, self.action_dim, self.state_dim, self.action_horizon, self.replan_steps)
             new_agent, actor_info = new_agent.update_actor(actor_batch)
+            actor_info = dict(actor_info)
         else:
             new_agent, actor_info = new_agent.update_actor(last_minibatch)
-
-        actor_info = dict(actor_info)
+            actor_info = dict(actor_info)
 
         if self.n_edit_samples > 0:
             new_agent, r_actor_info = new_agent.update_residual_actor(last_minibatch)

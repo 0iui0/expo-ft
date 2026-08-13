@@ -82,6 +82,7 @@ flags.DEFINE_float("boundary_blend_w0", 0.6, "Chunk-seam blend initial weight on
 # proven SFT open-loop deploy (1 base sample) and is safe. The base actor still
 # trains from RL updates; flip to False once the critic is warm-started.
 flags.DEFINE_boolean("only_base_actions", True, "Rollout action selection: True=1 base VLA sample (safe, SFT-like); False=full OTF (N candidates + residual + Q-select).")
+flags.DEFINE_boolean("freeze_base_actor", False, "Freeze the base Pi0.5 VLA (skip its BC update); only critic + residual adapt. Paper-faithful frozen prior — protects the base from drift.")
 
 flags.DEFINE_string("dataset_path", "", "Path to the dataset.")
 config_flags.DEFINE_config_file(
@@ -197,6 +198,8 @@ def main(_):
         raise ValueError(f"Unsupported model class: {model_cls}")
 
     from expo_ft.agents.vla.pi05 import build_pi05
+    # --freeze_base_actor overrides the config; flows into EXPOLearner via agent_kwargs.
+    FLAGS.config.freeze_base_actor = FLAGS.freeze_base_actor
     actor, actor_train_state, target_actor_params, agent_kwargs, vla_metadata = build_pi05(
         FLAGS.config, FLAGS.seed, mesh, data_sharding, replicated_sharding,
         resuming, env.task_description,

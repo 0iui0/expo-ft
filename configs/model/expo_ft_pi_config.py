@@ -47,6 +47,10 @@ def get_config():
     )
     config.pi05_asset_id = "cr5af/shaft_insert"
     config.actor_success_only = True
+    # Freeze the base Pi0.5 VLA (skip its BC update). True = paper-faithful frozen
+    # prior; only critic + residual adapt. Overridden per-run by the --freeze_base_actor
+    # flag in the trainers.
+    config.freeze_base_actor = False
     config.use_full_augmentation = True  # False = only crop (no rotate/color jitter)
 
     return config

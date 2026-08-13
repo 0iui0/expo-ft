@@ -54,7 +54,7 @@ FLAGS = flags.FLAGS
 flags.DEFINE_string("project_name", "expo-ft", "wandb project name.")
 flags.DEFINE_string("run_name", None, "Optional wandb run name.")
 flags.DEFINE_integer("seed", 42, "Random seed.")
-flags.DEFINE_integer("batch_size", 64, "Mini batch size.")
+flags.DEFINE_integer("batch_size", 16, "Mini batch size. 64 OOMs a single 32GB GPU: update_critic samples next actions through the frozen 3.3B Pi0.5 (batch*N flow passes). Keep small — this is single-GPU (no sample/update split).")
 flags.DEFINE_integer("utd_ratio", 20, "Update to data ratio.")
 flags.DEFINE_integer("pretrain_steps", 3000, "Number of offline critic-warmup updates.")
 flags.DEFINE_integer("num_data", 0, "Max number of offline demo episodes to load (0 = all).")
@@ -167,7 +167,11 @@ def main(_):
         seed=FLAGS.seed,
     )
     replay_buffer = create_replay_buffer(**rb_args)
-    offline_replay_buffer = create_replay_buffer(**rb_args)
+    # offline_ratio=0 -> the offline buffer is never sampled, so allocate a 1-slot
+    # stub instead of a second full-capacity buffer. Each full buffer is ~90GB of
+    # images at 265 episodes (443KB/slot x ~213k transitions); the duplicate was
+    # the host-RAM blowup. BatchProcessor still requires the arg to exist.
+    offline_replay_buffer = create_replay_buffer(**{**rb_args, "capacity": 1})
 
     # offline_ratio=0 seeds the demos into the online replay buffer; next_batch then
     # samples them directly (functionally offline — all data is demos). Base frozen,

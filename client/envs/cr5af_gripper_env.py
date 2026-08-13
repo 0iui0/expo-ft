@@ -56,6 +56,14 @@ EEF9D_SLICE = slice(0, 9)
 JOINT_SLICE = slice(9, 15)
 GRIPPER_IDX = 15
 
+# After the operator releases the deadman, keep applying their last gripper
+# intent for this many policy steps before handing the gripper back to the
+# policy (~1 replan / ~1 s at 8 Hz). Gives a buffer so the policy's default
+# (closed for shaft_insert) does not instantly clobber a just-issued manual
+# open/close. Arm control returns to the policy immediately; only the gripper
+# is latched.
+GRIP_LATCH_STEPS = 8
+
 # Workspace safety bounds (mm) — clamp ServoP xyz targets so the arm can't be
 # driven out of the proven box (matches deploy_cr5af_gripper / the recorder).
 WORKSPACE_MIN_MM = np.array([369.0, -245.0, 110.0], dtype=np.float64)
@@ -170,6 +178,11 @@ class CR5AFGripperEnv:
         # record_demo_gripper convention.
         self._hil_grip = 1.0          # HIL gripper intent (1=open, 0=closed)
         self._prev_btn0 = False
+        # Weakened gripper handoff (see GRIP_LATCH_STEPS): on deadman release,
+        # the operator's gripper intent stays applied for a short window before
+        # the policy regains gripper control.
+        self._prev_step_deadman = False
+        self._grip_latch_steps = 0
 
         # ── RT feed (port 30004) ───────────────────────────────────────────
         self._rt_sock: Optional[socket.socket] = None
@@ -949,6 +962,14 @@ class CR5AFGripperEnv:
                 logger.info("[HIL] gripper toggle -> %s",
                             "open" if self._hil_grip >= 0.5 else "close")
             self._prev_btn0 = btn0
+            # Arm the gripper-latch window on the deadman falling edge (release)
+            # BEFORE the if/elif below, so the operator's gripper intent is held
+            # starting on the very first post-release step (no one-step leak to
+            # the policy). Only the gripper is latched; the arm is already back
+            # on the policy.
+            if self._prev_step_deadman and not self._hil_deadman:
+                self._grip_latch_steps = GRIP_LATCH_STEPS
+            self._prev_step_deadman = self._hil_deadman
             # BTN_1 = deadman. It is sensed AND handled entirely in the 30 Hz
             # streamer (nominal capture, teleop increment, release hold) so takeover
             # latency is ~1 cycle, not a full inference period. If it were sensed
@@ -963,6 +984,13 @@ class CR5AFGripperEnv:
                     nom = None if self._hil_nominal_mm is None else self._hil_nominal_mm.copy()
                 if nom is not None:  # executed action = teleop nominal (meters)
                     action[0:3] = nom * MM_TO_M
+            elif self._grip_latch_steps > 0:
+                # Weakened handoff: deadman released, arm already back on the
+                # policy, but hold the operator's last gripper intent for a few
+                # more steps so the policy's default (closed) can't instantly
+                # override a just-issued manual open/close. Gripper only.
+                action[GRIPPER_IDX] = self._hil_grip
+                self._grip_latch_steps -= 1
 
         # ServoP takes an ABSOLUTE Cartesian target pose (mm, deg), NOT a
         # velocity. (Confirmed on hardware: feeding velocities makes the robot
